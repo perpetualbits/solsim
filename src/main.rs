@@ -100,6 +100,23 @@ const LOG_SIZE_BOOST: f32 = 6.0;
 const LOG_MIN_SIZE: f32 = 0.005;
 const LOG_MAX_SIZE: f32 = 0.12;
 
+/// Decode the body texture maps into the layers of the GPU texture array.
+///
+/// What: builds one RGBA layer per body map, with a white layer 0 for untextured
+/// bodies.
+/// How/why: layer 0 is plain white so untextured bodies (small moons) show their
+/// solid colour tint; the embedded maps follow in [`render::textures::TEXTURES`]
+/// order, so `layer_of(name)` lines up with this list.
+/// Units: each layer is `TEX_W·TEX_H·4` bytes of RGBA.
+fn build_body_layers() -> Vec<Vec<u8>> {
+    let white = vec![255u8; (render::textures::TEX_W * render::textures::TEX_H * 4) as usize];
+    let mut layers = vec![white];
+    for (_, bytes) in render::textures::TEXTURES {
+        layers.push(render::textures::decode_rgba(bytes));
+    }
+    layers
+}
+
 /// Load the star catalogue and turn it into ready-to-draw star instances.
 ///
 /// What: builds the GPU star list — a direction, colour and size per star.
@@ -809,11 +826,31 @@ impl App {
                 } else {
                     spec.draw_radius_au
                 };
+                // Bodies with a texture map sample it (white tint); the rest use
+                // the white layer 0 and show their solid colour.
+                let tex_layer = render::textures::layer_of(&spec.name.to_lowercase());
+                let color = if tex_layer != 0 { [1.0, 1.0, 1.0] } else { spec.color };
+
+                // Axial spin: rotate the texture about an axis tilted by the
+                // body's obliquity, by an angle that grows with time.
+                let (period, obliquity_deg) = bodies::rotation(spec.name);
+                let spin = if period != 0.0 {
+                    let obl = obliquity_deg.to_radians();
+                    let axis = DVec3::new(0.0, obl.sin(), obl.cos()).normalize();
+                    let angle = (std::f64::consts::TAU * (jd - astro::time::J2000) / period)
+                        .rem_euclid(std::f64::consts::TAU);
+                    [axis.x as f32, axis.y as f32, axis.z as f32, angle as f32]
+                } else {
+                    [0.0, 0.0, 1.0, 0.0]
+                };
+
                 Instance {
                     center: [rel.x, rel.y, rel.z],
                     radius,
-                    color: spec.color,
+                    color,
                     emissive: if spec.emissive { 1.0 } else { 0.0 },
+                    tex_layer,
+                    spin,
                 }
             })
             .collect();
@@ -852,6 +889,15 @@ impl App {
             s.b -= origin;
         }
         let grid_fade = grid::fade_distances(view_scale);
+
+        // Saturn's rings, when Saturn is shown (and not in log mode, which would
+        // distort them). Built around Saturn's position in the render frame.
+        let ring_verts = if !log && visible[bodies::SATURN_INDEX] {
+            let center = positions[bodies::SATURN_INDEX] - origin;
+            render::rings::build(center, BODIES[bodies::SATURN_INDEX].draw_radius_au as f64)
+        } else {
+            Vec::new()
+        };
 
         let info = HudInfo {
             date: format_date(jd),
@@ -975,6 +1021,7 @@ impl App {
             &trail_vertices,
             &trail_ranges,
             &line_segs,
+            &ring_verts,
         );
 
         // Pass 2: draw the egui overlay on top, keeping the rendered scene.
@@ -1088,10 +1135,12 @@ impl ApplicationHandler for App {
 
         let scene = Scene::new(
             &gpu.device,
+            &gpu.queue,
             gpu.config.format,
             DEPTH_FORMAT,
             BODIES.len() as u32,
             self.config.trail_length as u32,
+            &build_body_layers(),
             &build_star_instances(),
         );
 

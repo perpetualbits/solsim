@@ -89,6 +89,9 @@ pub struct BodyDef {
 /// Index of the Earth in [`BODIES`] (the default camera target).
 pub const EARTH_INDEX: usize = 3;
 
+/// Index of Saturn in [`BODIES`] (which gets the rings).
+pub const SATURN_INDEX: usize = 6;
+
 /// The full catalogue: Sun, eight planets, then the major moons.
 ///
 /// Draw radii are exaggerated so bodies are visible, but each planet's radius is
@@ -464,6 +467,32 @@ pub fn assemble(jd: f64, planet_pos: &[DVec3]) -> Vec<DVec3> {
         }
     }
     pos
+}
+
+/// A body's sidereal rotation period and axial tilt, for the spinning texture.
+///
+/// What: returns `(rotation_period_days, obliquity_degrees)` for a body name, or
+/// `(0, 0)` for bodies we do not spin (the untextured small moons).
+/// How/why: the planet maps look static without this. We spin the sphere about an
+/// axis tilted from the ecliptic by the obliquity. Retrograde spinners (Venus,
+/// Uranus) are captured by their large tilt (>90°) rather than a negative period.
+/// The Moon's period equals its orbit (it is tidally locked). The spin phase is
+/// arbitrary (the maps' prime meridians are not registered to real time).
+/// Units: period in days; obliquity in degrees.
+pub fn rotation(name: &str) -> (f64, f64) {
+    match name {
+        "Sun" => (25.38, 7.25),
+        "Mercury" => (58.646, 0.03),
+        "Venus" => (243.025, 177.4),
+        "Earth" => (0.99727, 23.44),
+        "Mars" => (1.02596, 25.19),
+        "Jupiter" => (0.41354, 3.13),
+        "Saturn" => (0.44401, 26.73),
+        "Uranus" => (0.71833, 97.77),
+        "Neptune" => (0.67125, 28.32),
+        "Moon" => (27.3217, 6.68),
+        _ => (0.0, 0.0),
+    }
 }
 
 /// Compute every body's position from the analytic ephemeris.

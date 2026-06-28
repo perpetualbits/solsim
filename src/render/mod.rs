@@ -9,9 +9,11 @@
 pub mod camera;
 pub mod grid;
 pub mod logscale;
+pub mod rings;
 pub mod screenshot;
 pub mod sphere;
 pub mod starfield;
+pub mod textures;
 pub mod trails;
 pub mod viewpoints;
 
@@ -19,6 +21,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
 use grid::{LinePass, LineSeg};
+use rings::{RingPass, RingVertex};
 use sphere::{BodyPass, Instance};
 use starfield::{StarInstance, StarfieldPass};
 use trails::{TrailPass, TrailVertex};
@@ -58,6 +61,7 @@ pub struct Scene {
     trail_pass: TrailPass,
     line_pass: LinePass,
     star_pass: StarfieldPass,
+    ring_pass: RingPass,
 }
 
 impl Scene {
@@ -68,12 +72,15 @@ impl Scene {
     /// it with both pipelines, so a single camera update feeds everything.
     /// Units: `body_count` is the maximum number of bodies (and trails); `stars`
     /// are the (static) background stars.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         body_count: u32,
         trail_len: u32,
+        body_layers: &[Vec<u8>],
         stars: &[StarInstance],
     ) -> Self {
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -106,12 +113,21 @@ impl Scene {
             }],
         });
 
-        let body_pass = BodyPass::new(device, &globals_layout, color_format, depth_format, body_count);
+        let body_pass = BodyPass::new(
+            device,
+            queue,
+            &globals_layout,
+            color_format,
+            depth_format,
+            body_count,
+            body_layers,
+        );
         let trail_pass =
             TrailPass::new(device, &globals_layout, color_format, depth_format, body_count, trail_len);
         let line_pass =
             LinePass::new(device, &globals_layout, color_format, depth_format, LINE_CAPACITY);
         let star_pass = StarfieldPass::new(device, color_format, depth_format, stars);
+        let ring_pass = RingPass::new(device, queue, &globals_layout, color_format, depth_format);
 
         Self {
             globals_buf,
@@ -120,6 +136,7 @@ impl Scene {
             trail_pass,
             line_pass,
             star_pass,
+            ring_pass,
         }
     }
 
@@ -149,6 +166,7 @@ impl Scene {
         trail_vertices: &[TrailVertex],
         trail_ranges: &[(u32, u32)],
         line_segs: &[LineSeg],
+        ring_verts: &[RingVertex],
     ) {
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
@@ -161,6 +179,7 @@ impl Scene {
         self.body_pass.upload(queue, instances);
         self.trail_pass.upload(queue, trail_vertices);
         self.line_pass.upload(queue, line_segs);
+        self.ring_pass.upload(queue, ring_verts);
         if show_stars {
             self.star_pass.update(queue, star_view_proj, viewport);
         }
@@ -204,5 +223,8 @@ impl Scene {
             .record(&mut pass, &self.globals_bind_group, trail_ranges);
         self.body_pass
             .record(&mut pass, &self.globals_bind_group, instances.len() as u32);
+        // Saturn's rings are translucent, so they come after the solid bodies.
+        self.ring_pass
+            .record(&mut pass, &self.globals_bind_group, ring_verts.len() as u32);
     }
 }
