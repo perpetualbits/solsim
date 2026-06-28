@@ -9,6 +9,7 @@
 pub mod camera;
 pub mod grid;
 pub mod logscale;
+pub mod screenshot;
 pub mod sphere;
 pub mod starfield;
 pub mod trails;
@@ -72,6 +73,7 @@ impl Scene {
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         body_count: u32,
+        trail_len: u32,
         stars: &[StarInstance],
     ) -> Self {
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -105,7 +107,8 @@ impl Scene {
         });
 
         let body_pass = BodyPass::new(device, &globals_layout, color_format, depth_format, body_count);
-        let trail_pass = TrailPass::new(device, &globals_layout, color_format, depth_format, body_count);
+        let trail_pass =
+            TrailPass::new(device, &globals_layout, color_format, depth_format, body_count, trail_len);
         let line_pass =
             LinePass::new(device, &globals_layout, color_format, depth_format, LINE_CAPACITY);
         let star_pass = StarfieldPass::new(device, color_format, depth_format, stars);

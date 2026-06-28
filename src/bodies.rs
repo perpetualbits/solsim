@@ -448,9 +448,8 @@ pub fn planet_positions(jd: f64) -> [DVec3; 8] {
 /// positions in AU.
 pub fn assemble(jd: f64, planet_pos: &[DVec3]) -> Vec<DVec3> {
     let mut pos = vec![DVec3::ZERO; BODIES.len()];
-    for slot in 0..PLANETS.len().min(planet_pos.len()) {
-        pos[slot + 1] = planet_pos[slot]; // BODIES index 1..=8 are the planets
-    }
+    let n = PLANETS.len().min(planet_pos.len()); // BODIES index 1..=8 are the planets
+    pos[1..1 + n].copy_from_slice(&planet_pos[..n]);
     for (i, body) in BODIES.iter().enumerate() {
         match &body.source {
             // Geocentric Moon (ELP) added to wherever the Earth currently is.

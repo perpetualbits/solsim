@@ -11,14 +11,6 @@ use std::collections::VecDeque;
 use bytemuck::{Pod, Zeroable};
 use glam::DVec3;
 
-/// How many past positions to remember per body.
-///
-/// What: the length of each trail's history.
-/// How/why: long enough that, at the default time speed, the Earth's trail closes
-/// into a full orbit circle when you zoom out; older points are dropped.
-/// Units: a count of recorded positions.
-pub const TRAIL_CAPACITY: usize = 4000;
-
 /// One point of a trail, ready for the GPU.
 ///
 /// What: a position plus a colour whose alpha encodes the point's age.
@@ -35,25 +27,27 @@ pub struct TrailVertex {
 
 /// The rolling position history of a single body.
 ///
-/// What: a fixed-length queue of recent true positions plus the trail's colour.
-/// How/why: a `VecDeque` lets us cheaply push the newest point and drop the
-/// oldest once we exceed [`TRAIL_CAPACITY`] — a ring buffer in disguise.
-/// Units: positions in AU; `color` is linear RGB.
+/// What: a length-limited queue of recent true positions plus the trail's colour.
+/// How/why: a `VecDeque` lets us cheaply push the newest point and drop the oldest
+/// once we exceed `capacity` — a ring buffer in disguise.
+/// Units: positions in AU; `color` is linear RGB; `capacity` a count of points.
 pub struct Trail {
     points: VecDeque<DVec3>,
     color: [f32; 3],
+    capacity: usize,
 }
 
 impl Trail {
-    /// Create an empty trail of a given colour.
+    /// Create an empty trail of a given colour and length.
     ///
     /// What: makes a trail with no history yet.
     /// How/why: reserves capacity up front so pushing points never reallocates.
-    /// Units: `color` is linear RGB in 0..1.
-    pub fn new(color: [f32; 3]) -> Self {
+    /// Units: `color` is linear RGB in 0..1; `capacity` a count of points.
+    pub fn new(color: [f32; 3], capacity: usize) -> Self {
         Self {
-            points: VecDeque::with_capacity(TRAIL_CAPACITY + 1),
+            points: VecDeque::with_capacity(capacity + 1),
             color,
+            capacity,
         }
     }
 
@@ -70,7 +64,7 @@ impl Trail {
             }
         }
         self.points.push_back(pos);
-        while self.points.len() > TRAIL_CAPACITY {
+        while self.points.len() > self.capacity {
             self.points.pop_front();
         }
     }
@@ -78,9 +72,8 @@ impl Trail {
     /// Remove all recorded points.
     ///
     /// What: empties the trail.
-    /// How/why: used by the "clear trails" key (added later); just drops history.
+    /// How/why: used by the "clear trails" (R) key; just drops the history.
     /// Units: none.
-    #[allow(dead_code)] // wired to the "clear trails" (R) control in a later phase
     pub fn clear(&mut self) {
         self.points.clear();
     }
@@ -126,14 +119,15 @@ pub struct TrailSet {
 }
 
 impl TrailSet {
-    /// Create a set of empty trails with the given colours.
+    /// Create a set of empty trails with the given colours and length.
     ///
-    /// What: one trail per colour supplied.
-    /// How/why: the caller passes the body colours so trails match their body.
-    /// Units: colours are linear RGB.
-    pub fn new(colors: &[[f32; 3]]) -> Self {
+    /// What: one trail per colour supplied, each holding up to `capacity` points.
+    /// How/why: the caller passes the body colours so trails match their body, and
+    /// the configured trail length.
+    /// Units: colours are linear RGB; `capacity` a count of points.
+    pub fn new(colors: &[[f32; 3]], capacity: usize) -> Self {
         Self {
-            trails: colors.iter().map(|c| Trail::new(*c)).collect(),
+            trails: colors.iter().map(|c| Trail::new(*c, capacity)).collect(),
         }
     }
 
@@ -154,7 +148,6 @@ impl TrailSet {
     /// What: clears all bodies' histories at once.
     /// How/why: convenience for the "clear trails" control.
     /// Units: none.
-    #[allow(dead_code)] // wired to the "clear trails" (R) control in a later phase
     pub fn clear(&mut self) {
         for trail in &mut self.trails {
             trail.clear();
@@ -246,15 +239,16 @@ impl TrailPass {
     /// How/why: line-strip topology, alpha blending so faded points are see-
     /// through, and depth testing on (but no depth writing) so trails sit behind
     /// the solid bodies without blocking each other.
-    /// Units: `body_count` × [`TRAIL_CAPACITY`] sets the buffer size in vertices.
+    /// Units: `body_count` × `trail_len` sets the buffer size in vertices.
     pub fn new(
         device: &wgpu::Device,
         globals_layout: &wgpu::BindGroupLayout,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         body_count: u32,
+        trail_len: u32,
     ) -> Self {
-        let capacity = body_count * TRAIL_CAPACITY as u32;
+        let capacity = body_count * trail_len;
         let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("trail vertices"),
             size: (capacity as usize * std::mem::size_of::<TrailVertex>()) as u64,

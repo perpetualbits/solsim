@@ -23,6 +23,7 @@ use winit::window::{Window, WindowId};
 
 mod astro;
 mod bodies;
+mod config;
 mod physics;
 mod render;
 mod stars;
@@ -37,15 +38,6 @@ use render::starfield::StarInstance;
 use render::trails::TrailSet;
 use render::viewpoints::{self, Observer, Viewpoint};
 use render::Scene;
-
-/// Default time speed: how many simulated seconds pass per real second.
-///
-/// What: the starting playback speed.
-/// How/why: ≈4.6 simulated days per real second, so the Moon (27.3-day orbit)
-/// completes a lap in about six seconds — fast enough to see it move, slow enough
-/// to follow.
-/// Units: simulated seconds per real second (dimensionless).
-const DEFAULT_SPEED_FACTOR: f64 = 400_000.0;
 
 /// Target spacing between trail samples, in simulated days.
 ///
@@ -154,6 +146,7 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    screenshot_supported: bool,
 }
 
 impl Gpu {
@@ -206,8 +199,15 @@ impl Gpu {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        // Allow copying from the surface (for screenshots) when supported.
+        let screenshot_supported = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if screenshot_supported {
+            usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format,
             width,
             height,
@@ -225,6 +225,7 @@ impl Gpu {
             device,
             queue,
             config,
+            screenshot_supported,
             depth_view,
         })
     }
@@ -468,10 +469,12 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 ui.label("P — show all planets & moons / just Sun–Earth–Moon");
                 ui.label("C — toggle 3-D grid");
                 ui.label("B — toggle star background");
+                ui.label("R — clear trails");
                 ui.label("L — toggle logarithmic distance mode");
                 ui.label("E / N / G — engine: Ephemeris / Newtonian / GR");
                 ui.label("[  /  ]  — GR strength ÷10 / ×10");
                 ui.label("F1 / H — open the manual");
+                ui.label("F12 — save a screenshot (PNG)");
                 ui.label("?  — toggle this help");
             });
     }
@@ -546,6 +549,9 @@ struct App {
     show_help: bool,
     show_manual: bool,
     manual_search: String,
+    screenshot_requested: bool,
+    screenshot_count: u32,
+    config: config::Config,
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
     last_frame: Option<Instant>,
@@ -561,17 +567,25 @@ impl App {
     /// date running at [`DEFAULT_SPEED_FACTOR`], and one trail is made per body
     /// using that body's colour.
     /// Units: none.
-    fn new() -> Self {
-        let mut clock = SimClock::now();
-        clock.set_speed_factor(DEFAULT_SPEED_FACTOR);
+    fn new(config: config::Config) -> Self {
+        // Start at the configured date (or "now"), at the configured speed.
+        let start_jd = match config.start_date {
+            Some((y, m, d)) => astro::time::jd_from_calendar(y, m, d, 0, 0, 0.0),
+            None => astro::time::jd_now(),
+        };
+        let mut clock = SimClock::new(start_jd);
+        clock.set_speed_factor(config.speed_days_per_sec * 86_400.0);
+
         let colors: Vec<[f32; 3]> = BODIES.iter().map(|b| b.color).collect();
 
         // The top-down camera: an orbit camera centred on the Sun, starting nearly
-        // straight down but free to be tilted and zoomed with the mouse.
-        let mut top_camera = OrbitCamera::default();
-        top_camera.target = DVec3::ZERO;
-        top_camera.radius = DEFAULT_TOP_DISTANCE;
-        top_camera.phi = 1.5; // ≈ 86°: almost straight down, clear of the pole
+        // straight down (φ ≈ 86°, clear of the pole) but free to be tilted/zoomed.
+        let top_camera = OrbitCamera {
+            target: DVec3::ZERO,
+            radius: DEFAULT_TOP_DISTANCE,
+            phi: 1.5,
+            ..Default::default()
+        };
 
         Self {
             window: None,
@@ -580,9 +594,12 @@ impl App {
             scene: None,
             clock,
             camera: OrbitCamera::default(),
-            trails: TrailSet::new(&colors),
+            trails: TrailSet::new(&colors, config.trail_length),
             viewpoint: Viewpoint::Free,
-            observer: Observer::default(),
+            observer: Observer {
+                lat_deg: config.observer_lat,
+                lon_deg: config.observer_lon,
+            },
             top_camera,
             focus_index: EARTH_INDEX,
             engine: Engine::Ephemeris,
@@ -596,6 +613,9 @@ impl App {
             show_help: false,
             show_manual: false,
             manual_search: String::new(),
+            screenshot_requested: false,
+            screenshot_count: 0,
+            config,
             dragging: false,
             last_cursor: None,
             last_frame: None,
@@ -662,6 +682,13 @@ impl App {
             } else {
                 self.fps * 0.9 + instant_fps * 0.1
             };
+        }
+
+        // Pull the screenshot request out now, before the GPU fields are borrowed.
+        let want_screenshot = std::mem::take(&mut self.screenshot_requested);
+        let shot_index = self.screenshot_count;
+        if want_screenshot {
+            self.screenshot_count += 1;
         }
 
         // --- advance time, sampling trails finely across the step ------------
@@ -977,6 +1004,28 @@ impl App {
         // Submit egui's buffer-upload commands, then our drawing commands.
         gpu.queue
             .submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+
+        // Save a screenshot of the rendered frame before presenting it.
+        if want_screenshot {
+            if gpu.screenshot_supported {
+                let path = std::path::PathBuf::from(format!("solarsim-{shot_index:04}.png"));
+                match render::screenshot::capture(
+                    &gpu.device,
+                    &gpu.queue,
+                    &frame.texture,
+                    gpu.config.width,
+                    gpu.config.height,
+                    gpu.config.format,
+                    &path,
+                ) {
+                    Ok(()) => println!("Saved screenshot to {}", path.display()),
+                    Err(e) => eprintln!("screenshot failed: {e}"),
+                }
+            } else {
+                eprintln!("screenshots are not supported by this display surface");
+            }
+        }
+
         frame.present();
 
         // Free any egui textures that are no longer needed.
@@ -1011,7 +1060,12 @@ impl ApplicationHandler for App {
             return; // already set up
         }
 
-        let attributes = Window::default_attributes().with_title("Solar System Simulator");
+        let attributes = Window::default_attributes()
+            .with_title("Solar System Simulator")
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.config.window_width,
+                self.config.window_height,
+            ));
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1037,6 +1091,7 @@ impl ApplicationHandler for App {
             gpu.config.format,
             DEPTH_FORMAT,
             BODIES.len() as u32,
+            self.config.trail_length as u32,
             &build_star_instances(),
         );
 
@@ -1073,7 +1128,11 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.draw(),
 
             // Left button down/up toggles "drag to orbit" mode.
-            WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
                 self.dragging = state == ElementState::Pressed && !egui_consumed;
             }
 
@@ -1147,6 +1206,7 @@ impl ApplicationHandler for App {
                         // GR strength ×10 / ÷10, to exaggerate the precession.
                         "]" => self.gr_strength = (self.gr_strength * 10.0).min(1.0e9),
                         "[" => self.gr_strength = (self.gr_strength * 0.1).max(1.0e-3),
+                        "r" => self.trails.clear(),
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,
                         // Time speed up / down by ×10, clamped to a sensible range.
@@ -1157,6 +1217,7 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::Space) => self.paused = !self.paused,
                     Key::Named(NamedKey::Tab) => self.cycle_focus(true),
                     Key::Named(NamedKey::F1) => self.show_manual = !self.show_manual,
+                    Key::Named(NamedKey::F12) => self.screenshot_requested = true,
                     _ => {}
                 }
             }
@@ -1193,7 +1254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Poll` keeps redrawing even with no input, so motion stays smooth.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new();
+    let mut app = App::new(config::load());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
