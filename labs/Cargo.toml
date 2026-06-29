@@ -1,0 +1,18 @@
+# The "labs" crate: a small, GPU-free playground where students build the
+# physics core of a solar-system simulator themselves, one function at a time.
+#
+# It is deliberately kept SEPARATE from the main `solarsim` product so that:
+#   * the surface a student reads is tiny (just `src/lib.rs`), with no graphics;
+#   * the main app's own test suite stays green (the labs start out unsolved, so
+#     their tests are red on purpose — running them here never touches the product).
+#
+# Work here with:   cd labs && cargo test
+[package]
+name = "labs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Same maths/vector library (and version) as the main project, so what you learn
+# here transfers directly. DVec3 is a 3-D vector of f64 (double precision).
+glam = "0.30"
