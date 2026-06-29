@@ -495,6 +495,43 @@ pub fn rotation(name: &str) -> (f64, f64) {
     }
 }
 
+/// A body's true mean radius, in AU (for the "real scale" toggle).
+///
+/// What: returns the body's actual size, in AU, by name.
+/// How/why: the catalogue's draw radii are exaggerated so bodies are visible; this
+/// gives the real values (radius in km ÷ 149 597 870.7 km/AU) so the program can
+/// show how tiny — and how far apart — everything really is. Unknown names fall
+/// back to a small default.
+/// Units: AU.
+pub fn real_radius_au(name: &str) -> f64 {
+    let km = match name {
+        "Sun" => 696_000.0,
+        "Mercury" => 2_440.0,
+        "Venus" => 6_052.0,
+        "Earth" => 6_371.0,
+        "Mars" => 3_390.0,
+        "Jupiter" => 69_911.0,
+        "Saturn" => 58_232.0,
+        "Uranus" => 25_362.0,
+        "Neptune" => 24_622.0,
+        "Moon" => 1_737.0,
+        "Phobos" => 11.0,
+        "Deimos" => 6.0,
+        "Io" => 1_821.0,
+        "Europa" => 1_561.0,
+        "Ganymede" => 2_634.0,
+        "Callisto" => 2_410.0,
+        "Titan" => 2_575.0,
+        "Rhea" => 764.0,
+        "Iapetus" => 735.0,
+        "Titania" => 789.0,
+        "Oberon" => 761.0,
+        "Triton" => 1_353.0,
+        _ => 500.0,
+    };
+    km / 149_597_870.7
+}
+
 /// Compute every body's position from the analytic ephemeris.
 ///
 /// What: convenience wrapper — planet positions from VSOP87, then [`assemble`].

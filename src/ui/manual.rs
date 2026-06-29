@@ -29,7 +29,8 @@ time passes.\n\n\
 Pick the focus body in the panel, or step through with Tab. Time runs with the keys \
 '.' and ',' (×10 faster / slower), Space pauses, and T jumps back to today. P shows \
 all planets and moons or just the Sun–Earth–Moon. C, B and L toggle the grid, the \
-stars and logarithmic mode.",
+stars and logarithmic mode. S switches body sizes between 'exaggerated' (easy to \
+see) and 'true' (their real radii). K opens the educational mode.",
     ),
     (
         "Time and Julian dates",
@@ -107,6 +108,28 @@ direction from the Sun, but its distance r is replaced by R₀·ln(1 + r/r₀). 
 the logarithm grows ever more slowly, the far-apart outer planets are pulled into \
 view without the inner ones piling onto the Sun — the whole system fits on screen at \
 once. This changes only the picture, never the real positions or the physics.",
+    ),
+    (
+        "True scale: how tiny everything really is",
+        "Press S to switch from the exaggerated drawing sizes to each body's *real* \
+radius (its size in km ÷ 149 597 871, the number of km in one AU). Suddenly the \
+planets shrink to specks: the Sun's radius is only about 0.0047 AU, and the Earth \
+about 0.000043 AU — far smaller than the gaps between them. This is the honest \
+picture of how empty space is. The normal mode exaggerates sizes only so you can \
+see the bodies; their positions are always real.",
+    ),
+    (
+        "Educational mode: one step at a time",
+        "Press K for a guided two-body demo (just the Sun and one planet) that shows \
+how the simulation actually works. It walks through one time step in five stages, \
+with a big arrow for every vector: where the planet is (yellow, the position r), \
+how fast it moves (green, the velocity v·Δt), gravity's pull bending the path (red, \
+a·Δt²), Einstein's tiny extra pull (magenta, exaggerated so you can see it), and \
+the updated velocity. Use 'Next' to advance a stage, 'Step' to take the step and \
+watch the orbit grow, or 'Play' to run it. Turn general relativity on and watch the \
+orbit slowly turn (precess). It is the same loop — compute the pull, nudge the \
+velocity, move, repeat — that runs the whole simulator, only with big visible steps \
+instead of tiny RK4 ones. Press K again to leave.",
     ),
 ];
 

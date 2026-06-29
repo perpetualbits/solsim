@@ -202,6 +202,43 @@ hidden in this mode.)
 
 ---
 
+## 10. True-scale toggle — `bodies::real_radius_au`
+
+A **display-only** size switch (key `S`). Normally bodies are drawn far larger than
+life so they are visible. True scale instead draws each body at its real radius:
+
+```
+radius_AU = radius_km / 149 597 870.7
+```
+
+(149 597 870.7 km = 1 AU.) This makes vivid how tiny the bodies are next to the
+distances between them — e.g. the Sun ≈ 0.00465 AU, the Earth ≈ 0.0000426 AU.
+Positions and physics are untouched; only the drawn radii (and Saturn's ring radius)
+change.
+
+## 11. Educational mode — `edu.rs`
+
+A self-contained **two-body demo** (key `K`) that visualises one integration step.
+The Sun sits at the origin; one planet starts at `r = 1.2 AU` with 0.85× the
+circular speed `v_circ = √(GM_sun/r)`, giving a clear ellipse. Each step uses
+**semi-implicit Euler** (deliberately simpler and bigger than the live RK4):
+
+```
+a = −GM_sun·r/|r|³  +  gr_strength·(μ/(c²|r|³))·[(4μ/|r| − v²)·r + 4(r·v)·v]
+v ← v + a·Δt
+r ← r + v·Δt
+```
+
+The step is split into five explanation phases, each revealing more vector arrows:
+position `r`, velocity drawn as `v·Δt`, gravity's effect as `a·Δt²`, the GR
+correction (exaggerated by `GR_ARROW_EXAG` and capped so it is visible), and the
+updated velocity. Velocity-type vectors are scaled by `Δt` and acceleration-type by
+`Δt²` so all arrows are comparable as *displacement per step* in AU. Turning GR on
+makes the orbit slowly precess. This is purely a teaching view; the live simulation
+keeps ticking in the background but is not shown.
+
+---
+
 ### Source-file map
 
 | Topic | File |
@@ -219,5 +256,7 @@ hidden in this mode.)
 | Viewpoints, sidereal time | `render/viewpoints.rs` |
 | Reference grid | `render/grid.rs` |
 | Logarithmic transform | `render/logscale.rs` |
+| True-scale radii | `bodies.rs` (`real_radius_au`) |
+| Educational mode & vector arrows | `edu.rs`, `render/arrows.rs` |
 | Trails | `render/trails.rs` |
 | In-app manual | `ui/manual.rs` |

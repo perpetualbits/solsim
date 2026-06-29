@@ -6,6 +6,7 @@
 //! Keeping all the GPU plumbing here leaves the maths modules (camera, ephemeris)
 //! free of graphics code, as the house rules ask.
 
+pub mod arrows;
 pub mod camera;
 pub mod grid;
 pub mod logscale;
@@ -20,6 +21,7 @@ pub mod viewpoints;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
+use arrows::{ArrowInstance, ArrowPass};
 use grid::{LinePass, LineSeg};
 use rings::{RingPass, RingVertex};
 use sphere::{BodyPass, Instance};
@@ -62,6 +64,7 @@ pub struct Scene {
     line_pass: LinePass,
     star_pass: StarfieldPass,
     ring_pass: RingPass,
+    arrow_pass: ArrowPass,
 }
 
 impl Scene {
@@ -128,6 +131,7 @@ impl Scene {
             LinePass::new(device, &globals_layout, color_format, depth_format, LINE_CAPACITY);
         let star_pass = StarfieldPass::new(device, color_format, depth_format, stars);
         let ring_pass = RingPass::new(device, queue, &globals_layout, color_format, depth_format);
+        let arrow_pass = ArrowPass::new(device, &globals_layout, color_format, depth_format, 64);
 
         Self {
             globals_buf,
@@ -137,6 +141,7 @@ impl Scene {
             line_pass,
             star_pass,
             ring_pass,
+            arrow_pass,
         }
     }
 
@@ -167,6 +172,7 @@ impl Scene {
         trail_ranges: &[(u32, u32)],
         line_segs: &[LineSeg],
         ring_verts: &[RingVertex],
+        arrow_instances: &[ArrowInstance],
     ) {
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
@@ -180,6 +186,7 @@ impl Scene {
         self.trail_pass.upload(queue, trail_vertices);
         self.line_pass.upload(queue, line_segs);
         self.ring_pass.upload(queue, ring_verts);
+        self.arrow_pass.upload(queue, arrow_instances);
         if show_stars {
             self.star_pass.update(queue, star_view_proj, viewport);
         }
@@ -226,5 +233,8 @@ impl Scene {
         // Saturn's rings are translucent, so they come after the solid bodies.
         self.ring_pass
             .record(&mut pass, &self.globals_bind_group, ring_verts.len() as u32);
+        // Vector arrows (educational mode) draw last, always on top.
+        self.arrow_pass
+            .record(&mut pass, &self.globals_bind_group, arrow_instances.len() as u32);
     }
 }

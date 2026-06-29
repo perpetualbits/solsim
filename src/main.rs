@@ -24,6 +24,7 @@ use winit::window::{Window, WindowId};
 mod astro;
 mod bodies;
 mod config;
+mod edu;
 mod physics;
 mod render;
 mod stars;
@@ -409,6 +410,7 @@ struct HudInfo {
     gr_strength: f64,
     show_gr: bool,
     log: bool,
+    true_scale: bool,
     show_all: bool,
     show_grid: bool,
     show_stars: bool,
@@ -467,6 +469,12 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
             let grid = if info.show_grid { "on" } else { "off" };
             let stars = if info.show_stars { "on" } else { "off" };
             ui.label(format!("Grid: {grid}   Stars: {stars}"));
+            let scale = if info.true_scale {
+                "true (real radii)"
+            } else {
+                "exaggerated"
+            };
+            ui.label(format!("Body size: {scale}"));
             ui.label(format!("FPS: {:.0}", info.fps));
             ui.separator();
             ui.label("Press ? for controls");
@@ -488,6 +496,8 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 ui.label("B — toggle star background");
                 ui.label("R — clear trails");
                 ui.label("L — toggle logarithmic distance mode");
+                ui.label("S — body size: real ↔ exaggerated");
+                ui.label("K — educational mode (vector walkthrough)");
                 ui.label("E / N / G — engine: Ephemeris / Newtonian / GR");
                 ui.label("[  /  ]  — GR strength ÷10 / ×10");
                 ui.label("F1 / H — open the manual");
@@ -560,12 +570,14 @@ struct App {
     gr_strength: f64,
     paused: bool,
     log: bool,
+    true_scale: bool,
     show_all: bool,
     show_grid: bool,
     show_stars: bool,
     show_help: bool,
     show_manual: bool,
     manual_search: String,
+    edu: Option<edu::Edu>,
     screenshot_requested: bool,
     screenshot_count: u32,
     config: config::Config,
@@ -624,12 +636,14 @@ impl App {
             gr_strength: 1.0,
             paused: false,
             log: false,
+            true_scale: false,
             show_all: false,
             show_grid: true,
             show_stars: true,
             show_help: false,
             show_manual: false,
             manual_search: String::new(),
+            edu: None,
             screenshot_requested: false,
             screenshot_count: 0,
             config,
@@ -812,7 +826,7 @@ impl App {
         let origin_disp = display(origin);
 
         // --- build the GPU data for this frame -------------------------------
-        let instances: Vec<Instance> = BODIES
+        let mut instances: Vec<Instance> = BODIES
             .iter()
             .zip(positions.iter())
             .zip(visible.iter())
@@ -820,9 +834,13 @@ impl App {
             .map(|((spec, pos), _)| {
                 let rel = (display(*pos) - origin_disp).as_vec3();
                 // In log mode, distances shrink, so bodies are boosted (and
-                // clamped) to stay visible at the compressed scale.
+                // clamped) to stay visible at the compressed scale. In true-scale
+                // mode the real (tiny) radii are used instead of the exaggerated
+                // ones.
                 let radius = if log {
                     (spec.draw_radius_au * LOG_SIZE_BOOST).clamp(LOG_MIN_SIZE, LOG_MAX_SIZE)
+                } else if self.true_scale {
+                    bodies::real_radius_au(spec.name) as f32
                 } else {
                     spec.draw_radius_au
                 };
@@ -854,8 +872,8 @@ impl App {
                 }
             })
             .collect();
-        let (trail_vertices, trail_ranges) = self.trails.build(display, origin, &visible);
-        let sun_pos = (DVec3::ZERO - origin_disp).as_vec3();
+        let (mut trail_vertices, mut trail_ranges) = self.trails.build(display, origin, &visible);
+        let mut sun_pos = (DVec3::ZERO - origin_disp).as_vec3();
 
         // How "zoomed in" each view is, used to pick the grid's level of detail.
         let view_scale = match self.viewpoint {
@@ -892,9 +910,14 @@ impl App {
 
         // Saturn's rings, when Saturn is shown (and not in log mode, which would
         // distort them). Built around Saturn's position in the render frame.
-        let ring_verts = if !log && visible[bodies::SATURN_INDEX] {
+        let mut ring_verts = if !log && visible[bodies::SATURN_INDEX] {
             let center = positions[bodies::SATURN_INDEX] - origin;
-            render::rings::build(center, BODIES[bodies::SATURN_INDEX].draw_radius_au as f64)
+            let saturn_radius = if self.true_scale {
+                bodies::real_radius_au(BODIES[bodies::SATURN_INDEX].name)
+            } else {
+                BODIES[bodies::SATURN_INDEX].draw_radius_au as f64
+            };
+            render::rings::build(center, saturn_radius)
         } else {
             Vec::new()
         };
@@ -910,6 +933,7 @@ impl App {
             gr_strength: self.gr_strength,
             show_gr: self.engine == Engine::Relativistic,
             log: self.log,
+            true_scale: self.true_scale,
             show_all: self.show_all,
             show_grid: self.show_grid,
             show_stars: self.show_stars,
@@ -927,7 +951,7 @@ impl App {
         };
 
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
-        let view_proj = match self.viewpoint {
+        let mut view_proj = match self.viewpoint {
             Viewpoint::Free => self.camera.view_proj(aspect),
             Viewpoint::EclipticNorth => self.top_camera.view_proj(aspect),
             // Look at the southern sky (tilted up) with the local zenith as "up".
@@ -937,24 +961,47 @@ impl App {
         };
         // The stars use a rotation-only camera so they stay fixed on the sky. The
         // Earth-surface view is already at the origin, so its matrix works as-is.
-        let star_view_proj = match self.viewpoint {
+        let mut star_view_proj = match self.viewpoint {
             Viewpoint::Free => self.camera.star_view_proj(aspect),
             Viewpoint::EclipticNorth => self.top_camera.star_view_proj(aspect),
             Viewpoint::EarthSurface => {
                 viewpoints::earth_surface_view_proj(surface_forward, zenith, aspect)
             }
         };
+        let mut arrows: Vec<render::arrows::ArrowInstance> = Vec::new();
 
-        // Run the egui UI for this frame. The focus picker and manual write into
-        // local copies, applied back to `self` once the egui borrow has ended.
+        // Run the egui UI for this frame. The focus picker, manual and educational
+        // panel write into local copies, applied back to `self` afterwards.
         let mut new_focus = self.focus_index;
         let mut manual_open = self.show_manual;
         let mut manual_search = std::mem::take(&mut self.manual_search);
+        let mut edu_taken = self.edu.take();
         let raw_input = egui.state.take_egui_input(window);
         let full_output = egui.ctx.run_ui(raw_input, |ui| {
-            build_overlay(ui, &info, &mut new_focus);
-            ui::manual::show(ui.ctx(), &mut manual_open, &mut manual_search);
+            if let Some(e) = edu_taken.as_mut() {
+                edu::panel(ui.ctx(), e);
+            } else {
+                build_overlay(ui, &info, &mut new_focus);
+                ui::manual::show(ui.ctx(), &mut manual_open, &mut manual_search);
+            }
         });
+        self.edu = edu_taken;
+
+        // In educational mode, replace the scene with the two-body demo: the Sun
+        // and one planet, big vector arrows, and the path it has traced. The live
+        // system keeps ticking in the background but is not shown.
+        if let Some(e) = self.edu.as_mut() {
+            e.update(dt);
+            view_proj = self.camera.view_proj(aspect);
+            star_view_proj = self.camera.star_view_proj(aspect);
+            sun_pos = glam::Vec3::ZERO;
+            instances = e.instances();
+            trail_vertices = Vec::new();
+            trail_ranges = Vec::new();
+            line_segs = e.path_segments();
+            ring_verts = Vec::new();
+            arrows = e.arrows();
+        }
         egui.state
             .handle_platform_output(window, full_output.platform_output);
         let paint_jobs = egui
@@ -1022,6 +1069,7 @@ impl App {
             &trail_ranges,
             &line_segs,
             &ring_verts,
+            &arrows,
         );
 
         // Pass 2: draw the egui overlay on top, keeping the rendered scene.
@@ -1232,6 +1280,7 @@ impl ApplicationHandler for App {
                         "b" => self.show_stars = !self.show_stars,
                         "p" => self.show_all = !self.show_all,
                         "l" => self.log = !self.log,
+                        "s" => self.true_scale = !self.true_scale,
                         "t" => self.clock.reset_to_now(),
                         // Engine switching. N/G seed the integrator from the
                         // ephemeris only on entry, so N↔G keeps the same state and
@@ -1256,6 +1305,18 @@ impl ApplicationHandler for App {
                         "]" => self.gr_strength = (self.gr_strength * 10.0).min(1.0e9),
                         "[" => self.gr_strength = (self.gr_strength * 0.1).max(1.0e-3),
                         "r" => self.trails.clear(),
+                        "k" => {
+                            if self.edu.is_some() {
+                                self.edu = None;
+                            } else {
+                                self.edu = Some(edu::Edu::default());
+                                // Frame the two-body demo: centre on the Sun.
+                                self.camera.target = DVec3::ZERO;
+                                self.camera.radius = 3.0;
+                                self.camera.theta = 0.6;
+                                self.camera.phi = 0.5;
+                            }
+                        }
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,
                         // Time speed up / down by ×10, clamped to a sensible range.
