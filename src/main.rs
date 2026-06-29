@@ -137,11 +137,12 @@ fn build_body_layers() -> Vec<Vec<u8>> {
 ///
 /// What: builds the GPU star list — a direction, colour and size per star.
 /// How/why: for each catalogue star we project (RA, Dec) to an ecliptic direction,
-/// turn its B−V index into a colour, and its magnitude into a dot size. This is
-/// done once at start-up because the stars never change.
+/// turn its B−V index into a colour, and its magnitude into a dot size. We then
+/// append the faint procedural Milky Way band (stars concentrated along the
+/// galactic plane). This is done once at start-up because the stars never change.
 /// Units: directions are unit vectors; sizes in pixels; colours linear RGB.
 fn build_star_instances() -> Vec<StarInstance> {
-    stars::catalog::load()
+    let mut instances: Vec<StarInstance> = stars::catalog::load()
         .iter()
         .map(|s| {
             let dir = stars::project::radec_to_ecliptic(s.ra_deg, s.dec_deg);
@@ -152,7 +153,11 @@ fn build_star_instances() -> Vec<StarInstance> {
                 _pad: 0.0,
             }
         })
-        .collect()
+        .collect();
+    // The Milky Way: many faint stars hugging the galactic plane (key `B` hides
+    // the whole star background, this band included).
+    instances.extend(stars::galaxy::milky_way_band());
+    instances
 }
 
 /// The depth-buffer pixel format used for the whole program.

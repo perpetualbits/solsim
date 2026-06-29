@@ -19,7 +19,8 @@ known values.
   body, and the sky from a place on Earth (sidereal-time correct; default
   Zutphen).
 - **Bright-star background** — the 1500 brightest stars (Yale BSC5), coloured by
-  temperature and sized by brightness.
+  temperature and sized by brightness, plus a faint procedural Milky Way band along
+  the galactic plane.
 - **Time control** — speed up/slow down, pause, reset; fast inner planets still
   trace smooth orbits (sub-stepped sampling).
 - **Physics engine** — analytic ephemeris, or numerically integrated Newtonian

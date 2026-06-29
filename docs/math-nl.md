@@ -383,6 +383,35 @@ de getallen.
 
 ---
 
+## 13. De band van de Melkweg — `stars/galaxy.rs`, `stars/project.rs`
+
+Sterrenstelsels staan veel te ver weg om in een scène op AE-schaal te plaatsen (de
+dichtstbijzijnde ster staat al op ~270 000 AE, en het stelsel is miljarden AE
+groot), dus de Melkweg wordt op dezelfde manier getekend als de sterren: als
+**richtingen aan de hemel**, niet als objecten op een echte afstand.
+
+We strooien ~9000 vage sterren waarvan de galactische breedte `b` een
+Gauss-verdeling volgt (σ ≈ 6°), zodat ze tegen het **galactische vlak** aan kruipen,
+en geven ze een iets warmere tint richting het galactisch centrum (de verdikking).
+Omdat de sterrenachtergrond additief mengt, tellen de overlappende vage gloeden op
+tot de zachte band die je van opzij ziet, vanuit de schijf van ons eigen
+sterrenstelsel waarin we zitten. Een vaste toevalsstartwaarde maakt de band elke
+keer identiek, en hij wordt samen met de sterren verborgen (toets `B`).
+
+Om hem te plaatsen is de transformatie **galactisch → ecliptisch** nodig
+(`galactic_to_ecliptic`). Het galactische stelsel staat ≈63° scheef ten opzichte van
+de evenaar; het is gedefinieerd (IAU 1958, J2000) door de noordelijke galactische
+pool op RK 192,85948°, Dec +27,12825° en het galactisch centrum op RK 266,40499°,
+Dec −28,93617°. We bouwen een orthonormale basis uit die twee richtingen, drukken
+`(l, b)` daarin uit, en draaien daarna met de scheefstand ε naar het ecliptische
+stelsel — dezelfde laatste stap die de sterren gebruiken.
+
+**Controles:** de noordelijke galactische pool en het galactisch centrum worden op
+hun bekende hemelposities afgebeeld; de gemiddelde |galactische breedte| van de
+gegenereerde band blijft klein (unittests).
+
+---
+
 ### Overzicht van bronbestanden
 
 | Onderwerp | Bestand |
@@ -397,6 +426,7 @@ de getallen.
 | Energie, Hamiltoniaan, viriaal | `physics/energy.rs`, `ui/energy.rs` |
 | Sterrenkleuren & -groottes | `stars/color.rs` |
 | Plaatsing van sterren | `stars/project.rs`, `render/starfield.rs` |
+| Band van de Melkweg, galactische coördinaten | `stars/galaxy.rs`, `stars/project.rs` |
 | Baancamera | `render/camera.rs` |
 | Gezichtspunten, sterrentijd | `render/viewpoints.rs` |
 | Referentierooster | `render/grid.rs` |

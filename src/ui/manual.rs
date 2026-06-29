@@ -93,7 +93,9 @@ index' we estimate the temperature with the Ballesteros formula, then turn that 
 into a colour: hot stars (≈10000 K) look blue-white, cool stars (≈3500 K) \
 orange-red. A star's brightness is its 'magnitude', which is backwards — smaller \
 means brighter — and logarithmic. We draw brighter stars as bigger dots using \
-size = base·10^(0.2·(m_ref − m)).",
+size = base·10^(0.2·(m_ref − m)). Behind the bright stars lies a faint band of \
+thousands of dim stars along the galactic plane — the Milky Way, our own galaxy \
+seen edge-on from inside it. B hides the whole star background, band included.",
     ),
     (
         "The reference grid",

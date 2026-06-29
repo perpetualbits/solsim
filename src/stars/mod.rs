@@ -6,4 +6,5 @@
 
 pub mod catalog;
 pub mod color;
+pub mod galaxy;
 pub mod project;

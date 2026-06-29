@@ -361,6 +361,32 @@ members move — but here it is mainly a sanity check on the numbers.
 
 ---
 
+## 13. The Milky Way band — `stars/galaxy.rs`, `stars/project.rs`
+
+Galaxies are far too distant to place in an AU-scale scene (the nearest star is
+already ~270 000 AU away, and the galaxy is billions of AU across), so the Milky
+Way is drawn the same way as the stars: as **directions on the sky**, not objects
+at a true distance.
+
+We scatter ~9000 faint stars whose galactic latitude `b` follows a Gaussian
+(σ ≈ 6°), so they hug the **galactic plane**, and tint them slightly warmer toward
+the Galactic Centre (the bulge). Because the star background uses additive
+blending, the overlapping faint glows add up into the soft band you see edge-on
+from inside our own galaxy's disk. A fixed random seed makes the band identical
+every run, and it is hidden together with the stars (key `B`).
+
+Placing it needs the **galactic → ecliptic** transform (`galactic_to_ecliptic`).
+The galactic frame is tilted ≈63° to the equator; it is defined (IAU 1958, J2000)
+by the North Galactic Pole at RA 192.85948°, Dec +27.12825° and the Galactic Centre
+at RA 266.40499°, Dec −28.93617°. We build an orthonormal basis from those two
+directions, express `(l, b)` in it, then rotate by the obliquity ε into the
+ecliptic frame — the same final step the stars use.
+
+**Checks:** the North Galactic Pole and Galactic Centre map to their known sky
+positions; the generated band's mean |galactic latitude| stays small (unit tests).
+
+---
+
 ### Source-file map
 
 | Topic | File |
@@ -375,6 +401,7 @@ members move — but here it is mainly a sanity check on the numbers.
 | Energy, Hamiltonian, virial | `physics/energy.rs`, `ui/energy.rs` |
 | Star colours & sizes | `stars/color.rs` |
 | Star placement | `stars/project.rs`, `render/starfield.rs` |
+| Milky Way band, galactic coordinates | `stars/galaxy.rs`, `stars/project.rs` |
 | Orbit camera | `render/camera.rs` |
 | Viewpoints, sidereal time | `render/viewpoints.rs` |
 | Reference grid | `render/grid.rs` |
