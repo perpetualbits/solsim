@@ -444,7 +444,13 @@ impl BodyPass {
                 ],
             },
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                // No back-face culling. The cloud shell is a thin sphere drawn over
+                // the planet; with back-face culling its camera-facing hemisphere was
+                // being dropped and only the far side (poking past the planet's
+                // silhouette) showed, as a thin rim. Drawing both faces lets the
+                // near hemisphere appear over the planet; the far hemisphere is
+                // depth-rejected there and only adds a faint edge at the limb.
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -453,10 +459,8 @@ impl BodyPass {
                 // LessEqual, not Less: the shell sits just in front of the planet,
                 // but the huge far/near ratio (the far plane is pinned at ≥100 AU)
                 // leaves so little depth precision at the planet that the shell and
-                // the surface round to the *same* depth. Strict Less would then
-                // reject the whole near hemisphere and only the rim (against the
-                // far background) would show; LessEqual lets the coincident
-                // fragments through while nearer bodies still occlude the clouds.
+                // the surface can round to the *same* depth; strict Less would then
+                // reject those fragments. Nearer bodies still occlude the clouds.
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
