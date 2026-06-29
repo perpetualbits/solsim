@@ -450,7 +450,14 @@ impl BodyPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                // LessEqual, not Less: the shell sits just in front of the planet,
+                // but the huge far/near ratio (the far plane is pinned at ≥100 AU)
+                // leaves so little depth precision at the planet that the shell and
+                // the surface round to the *same* depth. Strict Less would then
+                // reject the whole near hemisphere and only the rim (against the
+                // far background) would show; LessEqual lets the coincident
+                // fragments through while nearer bodies still occlude the clouds.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
