@@ -1,44 +1,46 @@
-# Lab 5 — Energy, and the virial theorem
+# Practicum 5 — Energie, en het viriaaltheorema
 
-**Goal:** compute a body's kinetic and potential energy.
-**You edit:** `energies` in `src/lib.rs`. **Run:** `cargo test --test lab5`
+**Doel:** de kinetische en potentiële energie van een lichaam berekenen.
+**Jij past aan:** `energies` in `src/lib.rs`. **Draai:** `cargo test --test lab5`
 
 ---
 
-## The idea
+## Het idee
 
-There are two kinds of energy in an orbit:
+Er zijn twee soorten energie in een baan:
 
-- **Kinetic** — the energy of motion: `KE = ½·m·v²` (always positive).
-- **Potential** — energy stored in gravity: `PE = −G·M·m / r`. It is **negative**
-  because you would have to *add* energy to drag the body away from the Sun (out to
-  `r → ∞`, where `PE → 0`).
+- **Kinetische** — de bewegingsenergie: `KE = ½·m·v²` (altijd positief).
+- **Potentiële** — energie opgeslagen in de zwaartekracht: `PE = −G·M·m / r`. Die is
+  **negatief**, omdat je energie zou moeten *toevoegen* om het lichaam van de zon weg
+  te slepen (naar `r → ∞`, waar `PE → 0`).
 
-Return them as a pair `(KE, PE)`. In code: `v.length_squared()` is `v²` and
+Geef ze terug als paar `(KE, PE)`. In code: `v.length_squared()` is `v²` en
 `r.length()` is `r`; `gm_sun` is `G·M`.
 
-## Why it matters
+## Waarom dit belangrijk is
 
-For a closed system the **total** energy `KE + PE` cannot change — it is conserved.
-That is a powerful built-in check: if a simulation's total energy drifts, the
-numbers are going wrong (you saw Euler do this in Lab 3). The main app draws this
-live — press `Y` for the energy graph and watch the total line stay flat.
+Voor een gesloten systeem kan de **totale** energie `KE + PE` niet veranderen — die
+blijft behouden. Dat is een krachtige ingebouwde controle: als de totale energie van
+een simulatie afdwaalt, gaan de getallen de fout in (je zag Euler dit doen in
+Practicum 3). De echte app tekent dit live — druk op `Y` voor de energiegrafiek en
+kijk hoe de totaallijn vlak blijft.
 
-There is also the elegant **virial theorem**. For a circular orbit the speed
-satisfies `v² = G·M/r`, and if you put that into the two formulas you find:
+Er is ook het elegante **viriaaltheorema**. Voor een cirkelbaan voldoet de snelheid
+aan `v² = G·M/r`, en als je dat in de twee formules invult, vind je:
 
 ```
 KE = ½·m·(G·M/r),   PE = −m·(G·M/r)   ⇒   2·KE + PE = 0
 ```
 
-So the kinetic energy is exactly half the size of the (negative) potential energy.
-The test checks this identity — which only balances if *both* of your formulas are
-right.
+De kinetische energie is dus precies half zo groot als de (negatieve) potentiële
+energie. De test controleert deze gelijkheid — die alleen klopt als *beide* formules
+goed zijn.
 
-## Going deeper
+## Dieper graven
 
-The full story — how the equations of motion themselves come from the energy (the
-**Hamiltonian**), and a proper derivation of the virial theorem — is written up in
-[`../docs/MATHS.md`](../docs/MATHS.md), section 12.
+Het volledige verhaal — hoe de bewegingsvergelijkingen zelf uit de energie volgen
+(de **Hamiltoniaan**), en een nette afleiding van het viriaaltheorema — staat in
+[`../docs/MATHS.md`](../docs/MATHS.md), paragraaf 12.
 
-➡️ **Next:** [Lab 6 — finding a planet on its ellipse (Kepler's equation)](lab6.md).
+➡️ **Volgende:** [Practicum 6 — een planeet op zijn ellips vinden (vergelijking van
+Kepler)](lab6.md).

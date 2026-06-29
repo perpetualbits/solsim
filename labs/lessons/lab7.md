@@ -1,40 +1,43 @@
-# Lab 7 (stretch) — Mercury, Einstein, and the 43″
+# Practicum 7 (uitdaging) — Mercurius, Einstein en de 43″
 
-**Goal:** reproduce a famous prediction of General Relativity.
-**You edit:** `perihelion_advance_arcsec_per_century` in `src/lib.rs`.
-**Run:** `cargo test --test lab7`
+**Doel:** een beroemde voorspelling van de algemene relativiteitstheorie
+reproduceren.
+**Jij past aan:** `perihelion_advance_arcsec_per_century` in `src/lib.rs`.
+**Draai:** `cargo test --test lab7`
 
 ---
 
-## The story
+## Het verhaal
 
-Newton's gravity says a single planet traces the *same* ellipse forever. But
-astronomers measured that Mercury's ellipse slowly **rotates**: its perihelion (the
-point closest to the Sun) creeps around by a tiny angle each orbit. Most of it is
-caused by the other planets, but a stubborn **43 arc-seconds per century** was left
-unexplained — until Einstein's General Relativity predicted exactly that amount. It
-was one of the first great confirmations of the theory.
+Newtons zwaartekracht zegt dat één enkele planeet voor altijd *dezelfde* ellips
+beschrijft. Maar astronomen maten dat de ellips van Mercurius langzaam **draait**:
+zijn perihelium (het punt het dichtst bij de zon) kruipt elke baan een klein stukje
+verder. Het grootste deel wordt veroorzaakt door de andere planeten, maar er bleef
+een hardnekkige **43 boogseconden per eeuw** onverklaard — tot Einsteins algemene
+relativiteitstheorie precies dat bedrag voorspelde. Het was een van de eerste grote
+bevestigingen van de theorie.
 
-(An arc-second is 1/3600 of a degree — a very small angle. 43″/century is roughly
-the width of a coin seen from 100 metres, accumulating over a hundred years.)
+(Een boogseconde is 1/3600 van een graad — een zeer kleine hoek. 43″/eeuw is ruwweg
+de breedte van een muntje gezien vanaf 100 meter, opgebouwd over honderd jaar.)
 
-## The formula
+## De formule
 
-General Relativity adds a small extra pull. Worked through, it turns each orbit by
-
-```
-Δϖ = 6π·G·M / (c²·a·(1 − e²))      (radians per orbit)
-```
-
-where `a` is the orbit's size (semi-major axis), `e` its eccentricity, and `c` the
-speed of light. To get arc-seconds per century, multiply by the number of orbits in
-a century and convert radians to arc-seconds:
+De algemene relativiteitstheorie voegt een kleine extra trekkracht toe. Uitgewerkt
+draait die elke baan over
 
 ```
-rate = Δϖ × (36525 / period_days) × (180·3600 / π)
+Δϖ = 6π·G·M / (c²·a·(1 − e²))      (radialen per baan)
 ```
 
-## What to do
+waarbij `a` de grootte van de baan is (de halve lange as), `e` de excentriciteit, en
+`c` de lichtsnelheid. Om boogseconden per eeuw te krijgen, vermenigvuldig je met het
+aantal banen in een eeuw en reken je radialen om naar boogseconden:
+
+```
+snelheid = Δϖ × (36525 / period_days) × (180·3600 / π)
+```
+
+## Wat je moet doen
 
 ```rust
 use std::f64::consts::PI;
@@ -44,25 +47,27 @@ let rad_to_arcsec = 180.0 * 3600.0 / PI;
 per_orbit * orbits_per_century * rad_to_arcsec
 ```
 
-(`gm_sun = G·M`, and `C_LIGHT` is provided in the crate.)
+(`gm_sun = G·M`, en `C_LIGHT` wordt door de crate geleverd.)
 
-## Check yourself
+## Controleer jezelf
 
 ```text
 cargo test --test lab7
 ```
 
-Mercury (`a = 0.387099`, `e = 0.205630`, `period = 87.969` days) should come out
-near **43″/century**; Earth, farther out and rounder, gets only a few. You can
-*watch* this precession happen in the main app: switch to the GR engine (press `G`)
-and turn up its strength with `]` to see the orbit trace a rosette.
+Mercurius (`a = 0,387099`, `e = 0,205630`, `period = 87,969` dagen) zou rond de
+**43″/eeuw** moeten uitkomen; de aarde, verder weg en ronder, krijgt er maar een
+paar. Je kunt deze precessie zien gebeuren in de echte app: schakel naar de
+RT-motor (druk op `G`) en draai de sterkte op met `]` om de baan een rozet te zien
+trekken.
 
-## Where this lives in the real app
+## Waar dit in de echte app zit
 
-This is the closed-form check behind `src/physics/forces.rs`; the actual extra pull
-(the "1-post-Newtonian" term) is added to the acceleration there and explored
-step-by-step in the app's educational mode (press `K`).
+Dit is de gesloten-vormcontrole achter `src/physics/forces.rs`; de werkelijke extra
+trekkracht (de "1-post-Newtoniaanse" term) wordt daar bij de versnelling opgeteld en
+stap voor stap verkend in de educatieve modus van de app (druk op `K`).
 
-🎉 **That is the full proof-of-concept ladder.** You have now written straight-line
-motion, gravity, two integrators, energy, Kepler's equation, and a relativistic
-prediction — the real heart of a solar-system simulator.
+🎉 **Dat is de volledige proof-of-concept-ladder.** Je hebt nu rechtelijnige
+beweging, zwaartekracht, twee integratoren, energie, de vergelijking van Kepler en
+een relativistische voorspelling geschreven — het echte hart van een
+zonnestelselsimulator.

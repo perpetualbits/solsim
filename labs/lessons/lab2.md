@@ -1,70 +1,73 @@
-# Lab 2 — The pull of gravity
+# Practicum 2 — De zwaartekracht
 
-**Goal:** compute the acceleration the Sun gives a body.
-**You edit:** `gravity_acceleration` in `src/lib.rs`.
-**You run:** `cargo test --test lab2`
+**Doel:** de versnelling berekenen die de zon aan een lichaam geeft.
+**Jij past aan:** `gravity_acceleration` in `src/lib.rs`.
+**Jij draait:** `cargo test --test lab2`
 
 ---
 
-## The idea
+## Het idee
 
-In Lab 1 the body coasted in a straight line. Real planets curve, because the Sun
-**pulls** on them. Newton's law of universal gravitation tells us how strong that
-pull is and which way it points.
+In Practicum 1 dreef het lichaam in een rechte lijn. Echte planeten krommen, omdat
+de zon eraan **trekt**. Newtons gravitatiewet vertelt ons hoe sterk die trekkracht
+is en welke kant hij op wijst.
 
-**Strength.** The acceleration gets weaker with the *square* of the distance:
+**Sterkte.** De versnelling wordt zwakker met het *kwadraat* van de afstand:
 
 ```
 |a| = G·M / r²
 ```
 
-Here `G·M` (we call it `gm` in the code) is a single number measuring the Sun's
-gravity, and `r` is the distance to the Sun. Twice as far away → only a quarter of
-the pull. This is the famous **inverse-square law**.
+Hier is `G·M` (in de code noemen we het `gm`) één getal dat de zwaartekracht van de
+zon meet, en `r` is de afstand tot de zon. Twee keer zo ver weg → nog maar een
+kwart van de trekkracht. Dit is de beroemde **kwadratenwet** (omgekeerd evenredig
+met het kwadraat van de afstand).
 
-**Direction.** Gravity points straight *at* the Sun, which sits at the origin
-`(0, 0, 0)`. The body's position vector `r⃗` points the other way — *from* the Sun
-*to* the body — so we need a minus sign to turn it around.
+**Richting.** De zwaartekracht wijst recht *naar* de zon, die in de oorsprong
+`(0, 0, 0)` staat. De positievector `r⃗` van het lichaam wijst de andere kant op —
+*van* de zon *naar* het lichaam — dus we hebben een minteken nodig om hem om te
+draaien.
 
-Putting strength and direction together gives the vector formula:
+Sterkte en richting samen geven de vectorformule:
 
 ```
 a⃗ = −G·M · r⃗ / |r⃗|³
 ```
 
-Why the **cube** `|r⃗|³` on the bottom? Two of those powers are the inverse-square
-strength (`/r²`). The third one turns the position vector `r⃗` into a pure
-*direction* of length 1 (dividing a vector by its own length gives a unit vector).
-So the formula is really "strength × direction" hidden in one tidy expression.
+Waarom de **derde macht** `|r⃗|³` onderin? Twee van die machten zijn de
+kwadratensterkte (`/r²`). De derde maakt van de positievector `r⃗` een zuivere
+*richting* met lengte 1 (een vector delen door zijn eigen lengte geeft een
+eenheidsvector). De formule is dus eigenlijk "sterkte × richting", verstopt in één
+nette uitdrukking.
 
-## What to do
+## Wat je moet doen
 
-In `src/lib.rs`, fill in `gravity_acceleration`:
+Vul in `src/lib.rs` de functie `gravity_acceleration` in:
 
-1. Get the distance: `let len = r.length();` (this is `|r⃗|`).
-2. Return `-gm * r / (len * len * len)`.
+1. Bereken de afstand: `let len = r.length();` (dit is `|r⃗|`).
+2. Geef terug: `-gm * r / (len * len * len)`.
 
-(`len * len * len` is `|r⃗|³`. You could also write `len.powi(3)`.)
+(`len * len * len` is `|r⃗|³`. Je mag ook `len.powi(3)` schrijven.)
 
-## A worked number
+## Een uitgewerkt getal
 
-At `r = 1 AU` with the Sun's `gm = GM_SUN`, the distance is 1, so `|a| = GM_SUN`
-(about `2.96×10⁻⁴` AU/day²) and it points in the −x direction. The test checks
-exactly this, plus the inverse-square fall-off and the direction in full 3-D.
+Bij `r = 1 AE` met de `gm = GM_SUN` van de zon is de afstand 1, dus `|a| = GM_SUN`
+(ongeveer `2,96×10⁻⁴` AE/dag²), en hij wijst in de −x-richting. De test controleert
+precies dit, plus de kwadratenafname en de richting in volledig 3D.
 
-## Check yourself
+## Controleer jezelf
 
 ```text
 cargo test --test lab2
 ```
 
-## Think about it
+## Denk er eens over na
 
-- What would orbits look like if gravity fell off as `1/r` or `1/r³` instead of
-  `1/r²`? (It turns out `1/r²` is special: it is one of only two force laws that
-  give orbits which close into a neat ellipse. The real simulator lets you explore
-  this idea.)
+- Hoe zouden banen eruitzien als de zwaartekracht afnam als `1/r` of `1/r³` in
+  plaats van `1/r²`? (Het blijkt dat `1/r²` bijzonder is: het is een van slechts
+  twee krachtwetten die banen geven die netjes tot een ellips sluiten. De echte
+  simulator laat je dit idee verkennen.)
 
-➡️ **Coming next:** Lab 3 will combine Labs 1 and 2 into a real time step — and
-show why doing it the obvious way makes the orbit slowly spiral, which is why we
-later need a cleverer method (RK4).
+➡️ **Hierna:** Practicum 3 combineert Practicum 1 en 2 tot een echte tijdstap — en
+laat zien waarom de voor de hand liggende manier de baan langzaam laat spiraliseren,
+waardoor we later een slimmere methode (RK4) nodig hebben.

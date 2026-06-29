@@ -1,45 +1,46 @@
-# Lab 6 — Where is the planet? (Kepler's equation)
+# Practicum 6 — Waar is de planeet? (vergelijking van Kepler)
 
-**Goal:** solve an equation that cannot be solved with algebra.
-**You edit:** `solve_kepler` in `src/lib.rs`. **Run:** `cargo test --test lab6`
+**Doel:** een vergelijking oplossen die je niet met algebra kunt oplossen.
+**Jij past aan:** `solve_kepler` in `src/lib.rs`. **Draai:** `cargo test --test lab6`
 
 ---
 
-## The idea
+## Het idee
 
-A planet does not move at a steady angle around its ellipse — it speeds up near the
-Sun and slows down far away (Kepler's second law). Astronomers handle this with two
-angles:
+Een planeet beweegt niet met een vaste hoek rond zijn ellips — hij versnelt dicht
+bij de zon en vertraagt ver weg (de tweede wet van Kepler). Astronomen lossen dit op
+met twee hoeken:
 
-- the **mean anomaly** `M` — a pretend angle that *does* grow steadily with time
-  (like a clock hand), and
-- the **eccentric anomaly** `E` — the angle that actually pins down the planet's
-  place on the ellipse.
+- de **gemiddelde anomalie** `M` — een nephoek die *wel* gelijkmatig met de tijd
+  groeit (als een klokwijzer), en
+- de **excentrische anomalie** `E` — de hoek die de plaats van de planeet op de
+  ellips echt vastlegt.
 
-They are tied together by **Kepler's equation**:
+Ze zijn aan elkaar verbonden door de **vergelijking van Kepler**:
 
 ```
 M = E − e·sin E
 ```
 
-where `e` is the eccentricity (how stretched the ellipse is). The problem: you are
-given `M` and `e` and want `E` — but you cannot rearrange this for `E`, because `E`
-is stuck both inside and outside a sine.
+waarbij `e` de excentriciteit is (hoe uitgerekt de ellips is). Het probleem: je
+krijgt `M` en `e` en wilt `E` — maar je kunt dit niet voor `E` herschrijven, omdat
+`E` zowel binnen als buiten een sinus zit.
 
-## The method: Newton's method
+## De methode: de methode van Newton
 
-When you cannot solve an equation directly, you *guess and improve*. Write the
-equation as "find `E` where `f(E) = E − e·sin E − M = 0`". Newton's method jumps to
-where the tangent line hits zero:
+Als je een vergelijking niet rechtstreeks kunt oplossen, ga je *gokken en
+verbeteren*. Schrijf de vergelijking als "vind `E` waarvoor `f(E) = E − e·sin E − M =
+0`". De methode van Newton springt naar waar de raaklijn de nul raakt:
 
 ```
-E ← E − f(E) / f′(E)     with   f′(E) = 1 − e·cos E
+E ← E − f(E) / f′(E)     met   f′(E) = 1 − e·cos E
 ```
 
-Start from `E = M` and repeat a handful of times (8 is plenty). Each round roughly
-*doubles* the number of correct digits, so it converges almost instantly.
+Begin bij `E = M` en herhaal een handvol keer (8 is ruim voldoende). Elke ronde
+*verdubbelt* ongeveer het aantal correcte cijfers, dus het convergeert vrijwel
+onmiddellijk.
 
-## What to do
+## Wat je moet doen
 
 ```rust
 let mut big_e = mean_anomaly;
@@ -51,15 +52,15 @@ for _ in 0..8 {
 big_e
 ```
 
-## Check yourself
+## Controleer jezelf
 
 ```text
 cargo test --test lab6
 ```
 
-Three tests: with `e = 0` the answer is just `M`; the answer always satisfies
-`M = E − e·sin E` to high precision; and it matches a known value from Meeus'
-*Astronomical Algorithms* (`M = 5°, e = 0.0167 → E ≈ 5.0855°`). The main app uses
-this exact solver for the moons (`src/astro/elements.rs`).
+Drie tests: bij `e = 0` is het antwoord gewoon `M`; het antwoord voldoet altijd aan
+`M = E − e·sin E` met hoge precisie; en het komt overeen met een bekende waarde uit
+Meeus' *Astronomical Algorithms* (`M = 5°, e = 0,0167 → E ≈ 5,0855°`). De echte app
+gebruikt precies deze oplosser voor de manen (`src/astro/elements.rs`).
 
-➡️ **Next (stretch):** [Lab 7 — Mercury and Einstein](lab7.md).
+➡️ **Volgende (uitdaging):** [Practicum 7 — Mercurius en Einstein](lab7.md).
