@@ -239,6 +239,123 @@ keeps ticking in the background but is not shown.
 
 ---
 
+## 12. Energy, the Hamiltonian, and the virial theorem — `physics/energy.rs`
+
+This section explains the energy graph (key `Y`) and, more importantly, *why* the
+equations the simulator integrates are the right ones. It is the deepest part of the
+manual; take it slowly.
+
+### 12.1 The two energies
+
+A moving body carries **kinetic energy**, the energy of motion:
+
+```
+T = ½·m·v²          (v = |v⃗| is the speed)
+```
+
+Gravity stores **potential energy**. For one planet of mass `m` at distance `r`
+from the Sun (mass `M`) it is
+
+```
+U = −G·M·m / r
+```
+
+`U` is *negative* and grows toward 0 as `r → ∞`: that is just bookkeeping for "you
+must *add* energy to drag the planet away against the Sun's pull." For the whole
+system we add the Sun's pull on every planet **and** every planet–planet pull:
+
+```
+T = Σᵢ ½·mᵢ·vᵢ²
+U = −Σᵢ G·M·mᵢ/rᵢ  −  Σ_{i<j} G·mᵢ·mⱼ / r_ij
+E = T + U                         (the total energy)
+```
+
+In our units mass is measured in **solar masses**, so `M = 1` and `G = k² = GM_sun`.
+That makes the code tidy: `G·M·mᵢ = gmᵢ` and `G·mᵢ·mⱼ = gmᵢ·gmⱼ / GM_sun`, which is
+exactly what `system_energy` computes. (Units of energy here: M_sun·AU²·day⁻².)
+
+### 12.2 Why the total stays flat: conservation of energy
+
+Differentiate `E` with respect to time and use Newton's law `mᵢ·a⃗ᵢ = F⃗ᵢ` (the force
+is `F⃗ᵢ = −∂U/∂r⃗ᵢ`):
+
+```
+dE/dt = Σᵢ mᵢ·v⃗ᵢ·a⃗ᵢ + Σᵢ (∂U/∂r⃗ᵢ)·v⃗ᵢ
+      = Σᵢ v⃗ᵢ·F⃗ᵢ − Σᵢ v⃗ᵢ·F⃗ᵢ = 0
+```
+
+So for pure Newtonian gravity the total energy **cannot change**. That is the white
+line on the graph: it should be perfectly flat. In practice it drifts a little,
+because RK4 with a finite step is only *approximately* exact, and the **exaggerated
+GR term is a velocity-dependent force that is not the gradient of a simple potential**
+— so with relativity on, energy is not expected to be conserved at all. Watching the
+line is therefore a live check on how trustworthy the integration is.
+
+### 12.3 The Hamiltonian — and getting the motion *from* the energy
+
+Write the energy using **momentum** `p⃗ᵢ = mᵢ·v⃗ᵢ` instead of velocity. The result,
+seen as a function of positions `r⃗ᵢ` and momenta `p⃗ᵢ`, is the **Hamiltonian**:
+
+```
+H(r⃗, p⃗) = Σᵢ |p⃗ᵢ|² / (2·mᵢ)  +  U(r⃗)        (= T + U = E)
+```
+
+The whole of the motion follows from `H` through **Hamilton's equations**:
+
+```
+dr⃗ᵢ/dt =  ∂H/∂p⃗ᵢ          ṗ⃗ᵢ = −∂H/∂r⃗ᵢ
+```
+
+Let us check that these *give back Newton*. The first one:
+
+```
+dr⃗ᵢ/dt = ∂H/∂p⃗ᵢ = p⃗ᵢ/mᵢ = v⃗ᵢ          ✓ (momentum is mass × velocity)
+```
+
+The second one, using `∂U/∂r⃗ᵢ` for the Sun term `U = −G·M·mᵢ/rᵢ`:
+
+```
+ṗ⃗ᵢ = −∂U/∂r⃗ᵢ = −G·M·mᵢ·r⃗ᵢ / rᵢ³
+```
+
+Divide by `mᵢ` (since `p⃗ᵢ = mᵢ·v⃗ᵢ`, `ṗ⃗ᵢ/mᵢ = a⃗ᵢ`):
+
+```
+a⃗ᵢ = −G·M·r⃗ᵢ / rᵢ³
+```
+
+— exactly the acceleration in `physics/forces.rs`. So the simulator is really just
+*integrating Hamilton's equations*: the energy `H` **is** the law of motion, and the
+gravity formula we code is what you get by differentiating it. This is the modern,
+unifying way to see mechanics; the GR correction is an extra term layered on top.
+
+### 12.4 The virial theorem
+
+For gravity (an inverse-square force, where `U ∝ 1/r`) there is a beautiful relation
+between the time-averaged energies of a bound orbit:
+
+```
+2·⟨T⟩ + ⟨U⟩ = 0          ⇒  ⟨T⟩ = −½·⟨U⟩,  E = ⟨T⟩ + ⟨U⟩ = ½·⟨U⟩ = −⟨T⟩
+```
+
+(⟨·⟩ means "averaged over one orbit".) It comes from looking at the quantity
+`G = Σ p⃗ᵢ·r⃗ᵢ`: over a full, repeating orbit its average rate of change is zero, and
+working that out turns into `2⟨T⟩ + ⟨U⟩ = 0` precisely because the force goes as
+`1/r²`. A quick way to trust it: a **circular** orbit satisfies it at *every* instant,
+not just on average. There `v² = G·M/r`, so
+
+```
+T = ½·m·v² = ½·G·M·m/r,   U = −G·M·m/r   ⇒   2T + U = 0   ✓
+```
+
+That circular case is the unit test in `physics/energy.rs`. The theorem explains the
+*shape* of the graph: the total `E` sits below zero, roughly halfway down to the
+(negative) potential line, and the kinetic line mirrors it above zero. It also has a
+famous astrophysical use — weighing star clusters and galaxies from how fast their
+members move — but here it is mainly a sanity check on the numbers.
+
+---
+
 ### Source-file map
 
 | Topic | File |
@@ -250,6 +367,7 @@ keeps ticking in the background but is not shown.
 | Body catalogue & assembly | `bodies.rs` |
 | Newtonian + GR forces | `physics/forces.rs` |
 | RK4 integrator, state | `physics/nbody.rs` |
+| Energy, Hamiltonian, virial | `physics/energy.rs`, `ui/energy.rs` |
 | Star colours & sizes | `stars/color.rs` |
 | Star placement | `stars/project.rs`, `render/starfield.rs` |
 | Orbit camera | `render/camera.rs` |

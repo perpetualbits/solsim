@@ -58,6 +58,14 @@ const TRAIL_STEP_DAYS: f64 = 2.0;
 /// Units: a count.
 const MAX_TRAIL_SUBSTEPS: u32 = 48;
 
+/// How many energy samples the overlay graph keeps (its rolling window width).
+///
+/// What: the maximum length of the kinetic/potential/total-energy history.
+/// How/why: one sample is recorded per simulated frame; keeping a few hundred
+/// gives a readable scrolling graph without using noticeable memory.
+/// Units: a count of samples.
+const ENERGY_HIST_LEN: usize = 600;
+
 /// Target integrator step, in simulated days.
 ///
 /// What: how small a step the physics engine takes.
@@ -193,13 +201,11 @@ impl Gpu {
 
         let surface = instance.create_surface(window.clone())?;
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))?;
 
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -498,10 +504,12 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 ui.label("L — toggle logarithmic distance mode");
                 ui.label("S — body size: real ↔ exaggerated");
                 ui.label("K — educational mode (vector walkthrough)");
+                ui.label("Y — energy graph (kinetic / potential / total)");
                 ui.label("E / N / G — engine: Ephemeris / Newtonian / GR");
                 ui.label("[  /  ]  — GR strength ÷10 / ×10");
                 ui.label("F1 / H — open the manual");
                 ui.label("F12 — save a screenshot (PNG)");
+                ui.label("Q — quit the program");
                 ui.label("?  — toggle this help");
             });
     }
@@ -577,6 +585,8 @@ struct App {
     show_help: bool,
     show_manual: bool,
     manual_search: String,
+    show_energy: bool,
+    energy_hist: std::collections::VecDeque<ui::energy::Sample>,
     edu: Option<edu::Edu>,
     screenshot_requested: bool,
     screenshot_count: u32,
@@ -643,6 +653,8 @@ impl App {
             show_help: false,
             show_manual: false,
             manual_search: String::new(),
+            show_energy: false,
+            energy_hist: std::collections::VecDeque::new(),
             edu: None,
             screenshot_requested: false,
             screenshot_count: 0,
@@ -677,7 +689,11 @@ impl App {
         let n = BODIES.len();
         let mut i = self.focus_index;
         for _ in 0..n {
-            i = if forward { (i + 1) % n } else { (i + n - 1) % n };
+            i = if forward {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            };
             if self.show_all || BODIES[i].core {
                 self.focus_index = i;
                 break;
@@ -765,7 +781,8 @@ impl App {
                     if dt_days != 0.0 {
                         let n = (dt_days.abs() / PHYSICS_STEP_DAYS)
                             .ceil()
-                            .clamp(1.0, MAX_PHYSICS_SUBSTEPS as f64) as u32;
+                            .clamp(1.0, MAX_PHYSICS_SUBSTEPS as f64)
+                            as u32;
                         let h = dt_days / n as f64;
                         for k in 1..=n {
                             physics::nbody::rk4_step(
@@ -787,6 +804,43 @@ impl App {
                 }
             }
         };
+
+        // Record the system's energy for the overlay graph, but only while time is
+        // actually advancing (so a paused sim freezes the graph) and only when the
+        // graph is open (the ephemeris path needs extra velocity evaluations). The
+        // planets are BODIES indices 1..=8, matching the integrator's PLANET_GM and,
+        // in N-body mode, the integrator's own velocities.
+        if self.show_energy && dt_days != 0.0 {
+            let planet_pos = &positions[1..=bodies::PLANETS.len()];
+            let vel: Vec<DVec3> = match &self.state {
+                Some(st) => st.vel.clone(),
+                None => bodies::PLANETS
+                    .iter()
+                    .map(|&p| {
+                        astro::ephemeris::velocity_fd(
+                            |j| astro::ephemeris::planet_position(p, j),
+                            jd,
+                            1.0 / 32.0,
+                        )
+                    })
+                    .collect(),
+            };
+            let (ke, pe) = physics::energy::system_energy(
+                planet_pos,
+                &vel,
+                &bodies::PLANET_GM,
+                astro::constants::GM_SUN,
+            );
+            self.energy_hist.push_back(ui::energy::Sample {
+                ke,
+                pe,
+                total: ke + pe,
+            });
+            while self.energy_hist.len() > ENERGY_HIST_LEN {
+                self.energy_hist.pop_front();
+            }
+        }
+
         let earth = positions[EARTH_INDEX];
         let focus = positions[self.focus_index.min(positions.len() - 1)];
 
@@ -822,7 +876,13 @@ impl App {
         // mode. It is applied only here, at draw time — the stored positions and
         // physics are never changed.
         let log = self.log;
-        let display = |p: DVec3| if log { render::logscale::compress(p) } else { p };
+        let display = |p: DVec3| {
+            if log {
+                render::logscale::compress(p)
+            } else {
+                p
+            }
+        };
         let origin_disp = display(origin);
 
         // --- build the GPU data for this frame -------------------------------
@@ -847,7 +907,11 @@ impl App {
                 // Bodies with a texture map sample it (white tint); the rest use
                 // the white layer 0 and show their solid colour.
                 let tex_layer = render::textures::layer_of(&spec.name.to_lowercase());
-                let color = if tex_layer != 0 { [1.0, 1.0, 1.0] } else { spec.color };
+                let color = if tex_layer != 0 {
+                    [1.0, 1.0, 1.0]
+                } else {
+                    spec.color
+                };
 
                 // Axial spin: rotate the texture about an axis tilted by the
                 // body's obliquity, by an angle that grows with time.
@@ -975,6 +1039,9 @@ impl App {
         let mut new_focus = self.focus_index;
         let mut manual_open = self.show_manual;
         let mut manual_search = std::mem::take(&mut self.manual_search);
+        let mut energy_open = self.show_energy;
+        // The graph reads a flat copy of the history (a VecDeque is not contiguous).
+        let energy_samples: Vec<ui::energy::Sample> = self.energy_hist.iter().copied().collect();
         let mut edu_taken = self.edu.take();
         let raw_input = egui.state.take_egui_input(window);
         let full_output = egui.ctx.run_ui(raw_input, |ui| {
@@ -983,9 +1050,11 @@ impl App {
             } else {
                 build_overlay(ui, &info, &mut new_focus);
                 ui::manual::show(ui.ctx(), &mut manual_open, &mut manual_search);
+                ui::energy::show(ui.ctx(), &mut energy_open, &energy_samples);
             }
         });
         self.edu = edu_taken;
+        self.show_energy = energy_open;
 
         // In educational mode, replace the scene with the two-body demo: the Sun
         // and one planet, big vector arrows, and the path it has traced. The live
@@ -1097,8 +1166,11 @@ impl App {
         }
 
         // Submit egui's buffer-upload commands, then our drawing commands.
-        gpu.queue
-            .submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        gpu.queue.submit(
+            egui_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
 
         // Save a screenshot of the rendered frame before presenting it.
         if want_screenshot {
@@ -1317,6 +1389,8 @@ impl ApplicationHandler for App {
                                 self.camera.phi = 0.5;
                             }
                         }
+                        "y" => self.show_energy = !self.show_energy,
+                        "q" => event_loop.exit(),
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,
                         // Time speed up / down by ×10, clamped to a sensible range.

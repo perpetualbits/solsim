@@ -30,7 +30,8 @@ Pick the focus body in the panel, or step through with Tab. Time runs with the k
 '.' and ',' (×10 faster / slower), Space pauses, and T jumps back to today. P shows \
 all planets and moons or just the Sun–Earth–Moon. C, B and L toggle the grid, the \
 stars and logarithmic mode. S switches body sizes between 'exaggerated' (easy to \
-see) and 'true' (their real radii). K opens the educational mode.",
+see) and 'true' (their real radii). K opens the educational mode, and Y the energy \
+graph. Q quits the program.",
     ),
     (
         "Time and Julian dates",
@@ -117,6 +118,20 @@ planets shrink to specks: the Sun's radius is only about 0.0047 AU, and the Eart
 about 0.000043 AU — far smaller than the gaps between them. This is the honest \
 picture of how empty space is. The normal mode exaggerates sizes only so you can \
 see the bodies; their positions are always real.",
+    ),
+    (
+        "Energy: is it conserved?",
+        "Press Y for a graph of the planets' energy. A moving body has kinetic \
+energy KE = ½·m·v² (energy of motion); gravity stores potential energy \
+PE = −G·M·m/r (negative, because you must add energy to pull bodies apart). The \
+key idea is that their sum, the total energy, cannot change for a closed system — \
+so the white 'total' line should stay flat. If it slopes or wobbles, that is the \
+simulation drifting: bigger time steps and the exaggerated relativity term both \
+break perfect conservation, which is exactly why the graph is worth watching. \
+There is also the virial theorem: averaged over an orbit, 2·KE + PE = 0, so a \
+bound orbit always has more negative potential than positive kinetic energy. See \
+docs/MATHS.md for how the equations of motion follow from this energy (the \
+Hamiltonian).",
     ),
     (
         "Educational mode: one step at a time",

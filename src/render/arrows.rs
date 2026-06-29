@@ -239,7 +239,11 @@ impl ArrowPass {
         if count == 0 {
             return;
         }
-        queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&arrows[..count]));
+        queue.write_buffer(
+            &self.instance_buf,
+            0,
+            bytemuck::cast_slice(&arrows[..count]),
+        );
     }
 
     /// Record the arrow draw.

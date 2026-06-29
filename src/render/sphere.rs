@@ -173,7 +173,11 @@ fn generate_uv_sphere(sectors: u32, rings: u32) -> (Vec<Vertex>, Vec<u16>) {
 /// single instanced call (each instance picks its layer); each layer is the same
 /// `TEX_W×TEX_H` size.
 /// Units: each layer is `TEX_W·TEX_H·4` bytes of RGBA.
-fn upload_texture_array(device: &wgpu::Device, queue: &wgpu::Queue, layers: &[Vec<u8>]) -> wgpu::TextureView {
+fn upload_texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layers: &[Vec<u8>],
+) -> wgpu::TextureView {
     let depth = layers.len().max(1) as u32;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("body textures"),

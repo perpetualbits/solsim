@@ -124,10 +124,7 @@ mod tests {
     #[test]
     fn earth_is_about_one_au() {
         let d = (earth_position(J2000) - sun_position(J2000)).length();
-        assert!(
-            (0.98..=1.02).contains(&d),
-            "Earth-Sun distance was {d} AU"
-        );
+        assert!((0.98..=1.02).contains(&d), "Earth-Sun distance was {d} AU");
     }
 
     /// The Moon should be a few ten-thousandths of an AU from the Earth.

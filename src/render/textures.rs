@@ -15,14 +15,23 @@ pub const TEX_H: u32 = 512;
 /// here **plus one**.
 pub const TEXTURES: &[(&str, &[u8])] = &[
     ("sun", include_bytes!("../../assets/textures/sun.png")),
-    ("mercury", include_bytes!("../../assets/textures/mercury.png")),
+    (
+        "mercury",
+        include_bytes!("../../assets/textures/mercury.png"),
+    ),
     ("venus", include_bytes!("../../assets/textures/venus.png")),
     ("earth", include_bytes!("../../assets/textures/earth.png")),
     ("mars", include_bytes!("../../assets/textures/mars.png")),
-    ("jupiter", include_bytes!("../../assets/textures/jupiter.png")),
+    (
+        "jupiter",
+        include_bytes!("../../assets/textures/jupiter.png"),
+    ),
     ("saturn", include_bytes!("../../assets/textures/saturn.png")),
     ("uranus", include_bytes!("../../assets/textures/uranus.png")),
-    ("neptune", include_bytes!("../../assets/textures/neptune.png")),
+    (
+        "neptune",
+        include_bytes!("../../assets/textures/neptune.png"),
+    ),
     ("moon", include_bytes!("../../assets/textures/moon.png")),
 ];
 

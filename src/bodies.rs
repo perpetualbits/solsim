@@ -570,6 +570,9 @@ mod tests {
         let titan = (p[16] - p[6]).length(); // Titan around Saturn
         assert!((0.0078..0.0086).contains(&titan), "Titan–Saturn {titan}");
         let triton = (p[21] - p[8]).length(); // Triton around Neptune
-        assert!((0.0022..0.0026).contains(&triton), "Triton–Neptune {triton}");
+        assert!(
+            (0.0022..0.0026).contains(&triton),
+            "Triton–Neptune {triton}"
+        );
     }
 }

@@ -104,7 +104,9 @@ impl Edu {
             let rv = r.dot(v);
             let mu = GM_SUN;
             let c2 = C_LIGHT * C_LIGHT;
-            self.gr_strength * (mu / (c2 * rl * rl * rl)) * ((4.0 * mu / rl - v2) * r + 4.0 * rv * v)
+            self.gr_strength
+                * (mu / (c2 * rl * rl * rl))
+                * ((4.0 * mu / rl - v2) * r + 4.0 * rv * v)
         } else {
             DVec3::ZERO
         };
@@ -310,7 +312,8 @@ step it slowly turns the whole orbit (precession).",
                     (
                         "3. (General relativity is off)".into(),
                         "Turn on 'General relativity' to add Einstein's small extra pull. \
-Without it, Newton's gravity alone gives a closed ellipse.".into(),
+Without it, Newton's gravity alone gives a closed ellipse."
+                            .into(),
                     )
                 }
             }

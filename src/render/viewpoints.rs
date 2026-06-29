@@ -180,6 +180,9 @@ mod tests {
     fn eq_to_ecl_preserves_length() {
         let v = DVec3::new(0.3, -0.5, 0.8);
         let r = equatorial_to_ecliptic(v, OBLIQUITY_RAD);
-        assert!((r.length() - v.length()).abs() < 1e-12, "length changed: {r:?}");
+        assert!(
+            (r.length() - v.length()).abs() < 1e-12,
+            "length changed: {r:?}"
+        );
     }
 }

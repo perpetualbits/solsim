@@ -116,10 +116,13 @@ mod tests {
 
         // Relativistic (exaggerated): matches the closed-form prediction.
         let gr = 2000.0;
-        let expected = gr * 6.0 * std::f64::consts::PI * mu
-            / (C_LIGHT * C_LIGHT * a * (1.0 - e * e));
+        let expected =
+            gr * 6.0 * std::f64::consts::PI * mu / (C_LIGHT * C_LIGHT * a * (1.0 - e * e));
         let measured = run(gr);
-        assert!(measured > 0.0, "GR advance should be positive, got {measured}");
+        assert!(
+            measured > 0.0,
+            "GR advance should be positive, got {measured}"
+        );
         assert!(
             (measured - expected).abs() < 0.15 * expected,
             "GR advance {measured} vs expected {expected}"

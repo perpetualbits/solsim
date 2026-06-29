@@ -125,10 +125,21 @@ impl Scene {
             body_count,
             body_layers,
         );
-        let trail_pass =
-            TrailPass::new(device, &globals_layout, color_format, depth_format, body_count, trail_len);
-        let line_pass =
-            LinePass::new(device, &globals_layout, color_format, depth_format, LINE_CAPACITY);
+        let trail_pass = TrailPass::new(
+            device,
+            &globals_layout,
+            color_format,
+            depth_format,
+            body_count,
+            trail_len,
+        );
+        let line_pass = LinePass::new(
+            device,
+            &globals_layout,
+            color_format,
+            depth_format,
+            LINE_CAPACITY,
+        );
         let star_pass = StarfieldPass::new(device, color_format, depth_format, stars);
         let ring_pass = RingPass::new(device, queue, &globals_layout, color_format, depth_format);
         let arrow_pass = ArrowPass::new(device, &globals_layout, color_format, depth_format, 64);
@@ -234,7 +245,10 @@ impl Scene {
         self.ring_pass
             .record(&mut pass, &self.globals_bind_group, ring_verts.len() as u32);
         // Vector arrows (educational mode) draw last, always on top.
-        self.arrow_pass
-            .record(&mut pass, &self.globals_bind_group, arrow_instances.len() as u32);
+        self.arrow_pass.record(
+            &mut pass,
+            &self.globals_bind_group,
+            arrow_instances.len() as u32,
+        );
     }
 }

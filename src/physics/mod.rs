@@ -5,5 +5,6 @@
 //! separate from the rendering and the ephemeris (a house rule) makes the physics
 //! easy to test on its own.
 
+pub mod energy;
 pub mod forces;
 pub mod nbody;

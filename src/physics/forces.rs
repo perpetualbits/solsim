@@ -54,8 +54,7 @@ pub fn accelerations(
             let v2 = v.length_squared();
             let rv = ri.dot(v);
             let mu = sun_gm;
-            a += gr_strength * (mu / (c2 * r * r * r))
-                * ((4.0 * mu / r - v2) * ri + 4.0 * rv * v);
+            a += gr_strength * (mu / (c2 * r * r * r)) * ((4.0 * mu / r - v2) * ri + 4.0 * rv * v);
         }
 
         acc[i] = a;
@@ -75,7 +74,8 @@ pub fn accelerations(
 /// days; returns arc-seconds per (Julian) century.
 #[allow(dead_code)] // reference value for the test and the maths manual (Phase 8)
 pub fn perihelion_advance_arcsec_per_century(sun_gm: f64, a: f64, e: f64, period_days: f64) -> f64 {
-    let per_orbit_rad = 6.0 * std::f64::consts::PI * sun_gm / (C_LIGHT * C_LIGHT * a * (1.0 - e * e));
+    let per_orbit_rad =
+        6.0 * std::f64::consts::PI * sun_gm / (C_LIGHT * C_LIGHT * a * (1.0 - e * e));
     let orbits_per_century = 36_525.0 / period_days;
     let rad_to_arcsec = 180.0 * 3600.0 / std::f64::consts::PI;
     per_orbit_rad * orbits_per_century * rad_to_arcsec
@@ -91,6 +91,9 @@ mod tests {
     fn mercury_perihelion_advance() {
         // Mercury: a = 0.387099 AU, e = 0.205630, period = 87.969 days.
         let rate = perihelion_advance_arcsec_per_century(GM_SUN, 0.387099, 0.205630, 87.969);
-        assert!((42.0..44.0).contains(&rate), "Mercury GR advance = {rate}″/cy");
+        assert!(
+            (42.0..44.0).contains(&rate),
+            "Mercury GR advance = {rate}″/cy"
+        );
     }
 }

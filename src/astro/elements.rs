@@ -78,16 +78,17 @@ impl Elements {
     /// Units: `jd` in days; returns a position in AU (ecliptic frame, relative to
     /// the parent).
     pub fn position(&self, jd: f64) -> DVec3 {
-        let mean = self.m0_deg.to_radians()
-            + std::f64::consts::TAU * (jd - self.epoch) / self.period;
+        let mean =
+            self.m0_deg.to_radians() + std::f64::consts::TAU * (jd - self.epoch) / self.period;
         let ecc = solve_kepler(mean, self.e);
 
         // True anomaly ν and radius r in the orbital plane.
         let half = ecc / 2.0;
-        let nu = 2.0 * f64::atan2(
-            (1.0 + self.e).sqrt() * half.sin(),
-            (1.0 - self.e).sqrt() * half.cos(),
-        );
+        let nu = 2.0
+            * f64::atan2(
+                (1.0 + self.e).sqrt() * half.sin(),
+                (1.0 - self.e).sqrt() * half.cos(),
+            );
         let r = self.a * (1.0 - self.e * ecc.cos());
         let (xo, yo) = (r * nu.cos(), r * nu.sin());
 

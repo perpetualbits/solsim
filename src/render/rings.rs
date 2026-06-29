@@ -292,7 +292,11 @@ impl RingPass {
         if count == 0 {
             return;
         }
-        queue.write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(&vertices[..count]));
+        queue.write_buffer(
+            &self.vertex_buf,
+            0,
+            bytemuck::cast_slice(&vertices[..count]),
+        );
     }
 
     /// Record the ring draw.
