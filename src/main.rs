@@ -76,11 +76,18 @@ const PHYSICS_STEP_DAYS: f64 = 0.5;
 
 /// Most integrator sub-steps to take in a single frame.
 ///
-/// What: a cap on integration work per frame.
-/// How/why: bounds the cost of a huge time step; the integration coarsens beyond
-/// this but stays responsive.
+/// What: a cap on integration work per frame (the step *count*, not its size).
+/// How/why: bounds the cost of a huge time step. Unlike before, the step *size* is
+/// always held at [`PHYSICS_STEP_DAYS`] (see [`physics::nbody::plan_substeps`]), so
+/// hitting this cap makes integrated time fall behind real time rather than
+/// coarsen the step and corrupt short-period orbits. A bigger budget therefore
+/// lets integrated time keep up to higher speeds before that happens: the maximum
+/// integrated speed is about `budget · PHYSICS_STEP_DAYS · fps` simulated days per
+/// real second — at 4096 · 0.5 · 60 ≈ 1.2×10⁵ days/s (~340 yr/s). Past that, up to
+/// the 1×10⁸ days/s speed cap, integrated time deliberately lags and the HUD shows
+/// a "speed-limited" note. Each sub-step is a cheap RK4 over ~9 bodies.
 /// Units: a count.
-const MAX_PHYSICS_SUBSTEPS: u32 = 1024;
+const MAX_PHYSICS_SUBSTEPS: u32 = 4096;
 
 /// Base colour of the adaptive 3-D grid (linear RGB; alpha is set per level).
 const GRID_COLOR: [f32; 3] = [0.34, 0.40, 0.52];
@@ -409,6 +416,7 @@ struct HudInfo {
     date: String,
     earth_sun_au: f64,
     speed_factor: f64,
+    physics_speed_limited: bool,
     paused: bool,
     fps: f32,
     viewpoint: &'static str,
@@ -454,6 +462,15 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 format_speed(info.speed_factor)
             };
             ui.label(format!("Speed: {speed}"));
+            // At extreme speed the integrated engines cannot keep up without
+            // breaking short-period orbits, so time is held back on purpose; tell
+            // the user why the clock is lagging.
+            if info.physics_speed_limited {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 191, 0),
+                    "⚠ physics speed-limited (step capped)",
+                );
+            }
             let view_label = if info.log {
                 format!("{}  [LOG]", info.viewpoint)
             } else {
@@ -587,6 +604,9 @@ struct App {
     manual_search: String,
     show_energy: bool,
     energy_hist: std::collections::VecDeque<ui::energy::Sample>,
+    /// True when the integrated engine could not keep up this frame and time was
+    /// held back to protect orbit accuracy (shown as a HUD warning).
+    physics_speed_limited: bool,
     edu: Option<edu::Edu>,
     screenshot_requested: bool,
     screenshot_count: u32,
@@ -655,6 +675,7 @@ impl App {
             manual_search: String::new(),
             show_energy: false,
             energy_hist: std::collections::VecDeque::new(),
+            physics_speed_limited: false,
             edu: None,
             screenshot_requested: false,
             screenshot_count: 0,
@@ -747,12 +768,16 @@ impl App {
         if !self.paused {
             self.clock.advance(dt);
         }
-        let jd = self.clock.jd();
+        // `jd` is the time we will draw at. In the integrated engines it can be
+        // rolled back below if the physics could not keep up this frame.
+        let mut jd = self.clock.jd();
         let dt_days = jd - jd_start;
 
         let positions = match self.engine {
             // Analytic ephemeris: sample the real sky directly at sub-steps.
             Engine::Ephemeris => {
+                // The ephemeris is exact at any time, so it never speed-limits.
+                self.physics_speed_limited = false;
                 if dt_days != 0.0 {
                     let n = (dt_days.abs() / TRAIL_STEP_DAYS)
                         .ceil()
@@ -778,12 +803,15 @@ impl App {
                 };
                 // Take the state out so we can also borrow the trails.
                 if let Some(mut state) = self.state.take() {
+                    let mut limited = false;
                     if dt_days != 0.0 {
-                        let n = (dt_days.abs() / PHYSICS_STEP_DAYS)
-                            .ceil()
-                            .clamp(1.0, MAX_PHYSICS_SUBSTEPS as f64)
-                            as u32;
-                        let h = dt_days / n as f64;
+                        // Bound the step *size* (not just the count) so short-period
+                        // orbits stay accurate no matter how fast time is requested.
+                        let (n, h, lim) = physics::nbody::plan_substeps(
+                            dt_days,
+                            PHYSICS_STEP_DAYS,
+                            MAX_PHYSICS_SUBSTEPS,
+                        );
                         for k in 1..=n {
                             physics::nbody::rk4_step(
                                 &mut state,
@@ -795,11 +823,22 @@ impl App {
                             let jd_k = jd_start + h * k as f64;
                             self.trails.record(&bodies::assemble(jd_k, &state.pos));
                         }
+                        if lim {
+                            // We only advanced by n·h (< dt_days). Roll the clock
+                            // back to the time the physics actually reached, so the
+                            // sim falls behind real time instead of coarsening.
+                            let actual = jd_start + h * n as f64;
+                            self.clock.set_jd(actual);
+                            jd = actual;
+                        }
+                        limited = lim;
                     }
+                    self.physics_speed_limited = limited;
                     let pos = bodies::assemble(jd, &state.pos);
                     self.state = Some(state);
                     pos
                 } else {
+                    self.physics_speed_limited = false;
                     bodies::system_positions(jd)
                 }
             }
@@ -990,6 +1029,7 @@ impl App {
             date: format_date(jd),
             earth_sun_au: earth.length(),
             speed_factor: self.clock.speed_factor(),
+            physics_speed_limited: self.physics_speed_limited,
             paused: self.paused,
             fps: self.fps,
             viewpoint: self.viewpoint.name(),
