@@ -390,6 +390,8 @@ comparable; the real program takes tiny RK4 steps instead of these big ones.",
 /// Units: none (text).
 const PSEUDOCODE: &str = r#"# constants
 G·M_sun = k²            # Sun's gravity strength
+μ       = G·M_sun       # short name for it, used below
+c       = 173.144       # speed of light, in AU/day
 dt      = small step    # e.g. a fraction of a day
 
 # starting point (from the real ephemeris)
