@@ -38,6 +38,17 @@ pub const TEXTURES: &[(&str, &[u8])] = &[
 /// The Saturn ring texture (a radial strip with transparency).
 pub const RING_PNG: &[u8] = include_bytes!("../../assets/textures/saturn_ring.png");
 
+/// The texture-array layer holding the procedural cloud map.
+///
+/// What: the index of the baked cloud coverage texture.
+/// How/why: `build_body_layers` stacks the white default (layer 0), then the
+/// [`TEXTURES`] body maps, then appends the cloud layer — so it sits one past the
+/// last body map. The renderer points the Earth cloud shell at this layer.
+/// Units: a layer index.
+pub fn cloud_layer() -> u32 {
+    TEXTURES.len() as u32 + 1
+}
+
 /// The array layer for a texture key (`None` → the white layer 0).
 ///
 /// What: maps a body's texture name to its layer in the texture array.

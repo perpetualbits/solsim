@@ -412,6 +412,36 @@ gegenereerde band blijft klein (unittests).
 
 ---
 
+## 14. Procedurele wolken (fractale ruis) — `render/clouds.rs`, `render/sphere.rs`
+
+Wolken zien er op veel schalen hetzelfde uit, dus ze passen perfect bij
+**fractionele Brownse beweging (fBm)**: tel meerdere octaven van gladde
+waarde-ruis op, elk met twee keer de frequentie en de helft van de sterkte van de
+vorige. Een handvol octaven geeft al een rijk, zelfgelijkvormig veld — en het is
+goedkoop, want we bakken het één keer bij het opstarten in een textuur.
+
+```
+fbm(p) = Σᵢ amplitudeᵢ · ruis(2ⁱ·p),   amplitudeᵢ = ½ⁱ
+```
+
+We bemonsteren de ruis op de **eenheidsbol** (de 3D-richting van elke pixel) zodat
+de kaart naadloos rondloopt en niet samenknijpt bij de polen, verdraaien hem met een
+**domeinvervorming** (verschuif het monsterpunt met een tweede ruisveld) voor
+door-de-wind-gescheerde slierten, en zetten de fBm-waarde met `smoothstep` om in een
+zachte bedekkingsgraad. Die bedekking wordt opgeslagen als de alfa van de textuur.
+
+De aarde krijgt dan een dunne doorschijnende **wolkenschil**: een bol ~2% groter dan
+de planeet, getekend na de vaste lichamen met alfamenging en zonder dieptegegevens
+weg te schrijven, verlicht door dezelfde zon (zodat de wolken vervagen bij de
+terminator) en een paar procent sneller draaiend dan het oppervlak, zodat het weer
+verschuift. Hij wordt alleen verborgen wanneer de aarde zelf dat is (logaritmische
+modus, of het oppervlakteaanzicht waar je erop staat).
+
+**Controles:** waarde-ruis en fBm blijven in 0..1; de gebakken kaart bevat zowel
+heldere hemel als dichte bewolking (unittests).
+
+---
+
 ### Overzicht van bronbestanden
 
 | Onderwerp | Bestand |
@@ -427,6 +457,7 @@ gegenereerde band blijft klein (unittests).
 | Sterrenkleuren & -groottes | `stars/color.rs` |
 | Plaatsing van sterren | `stars/project.rs`, `render/starfield.rs` |
 | Band van de Melkweg, galactische coördinaten | `stars/galaxy.rs`, `stars/project.rs` |
+| Procedurele wolken (fBm) | `render/clouds.rs`, `render/sphere.rs` |
 | Baancamera | `render/camera.rs` |
 | Gezichtspunten, sterrentijd | `render/viewpoints.rs` |
 | Referentierooster | `render/grid.rs` |

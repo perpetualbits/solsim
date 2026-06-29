@@ -8,6 +8,7 @@
 
 pub mod arrows;
 pub mod camera;
+pub mod clouds;
 pub mod grid;
 pub mod logscale;
 pub mod rings;
@@ -179,6 +180,7 @@ impl Scene {
         star_view_proj: Mat4,
         show_stars: bool,
         instances: &[Instance],
+        cloud_instances: &[Instance],
         trail_vertices: &[TrailVertex],
         trail_ranges: &[(u32, u32)],
         line_segs: &[LineSeg],
@@ -194,6 +196,7 @@ impl Scene {
         };
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         self.body_pass.upload(queue, instances);
+        self.body_pass.upload_clouds(queue, cloud_instances);
         self.trail_pass.upload(queue, trail_vertices);
         self.line_pass.upload(queue, line_segs);
         self.ring_pass.upload(queue, ring_verts);
@@ -241,6 +244,12 @@ impl Scene {
             .record(&mut pass, &self.globals_bind_group, trail_ranges);
         self.body_pass
             .record(&mut pass, &self.globals_bind_group, instances.len() as u32);
+        // Translucent cloud shells drape over the solid bodies.
+        self.body_pass.record_clouds(
+            &mut pass,
+            &self.globals_bind_group,
+            cloud_instances.len() as u32,
+        );
         // Saturn's rings are translucent, so they come after the solid bodies.
         self.ring_pass
             .record(&mut pass, &self.globals_bind_group, ring_verts.len() as u32);

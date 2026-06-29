@@ -14,7 +14,8 @@ known values.
 
 - **Real ephemerides** — planets via VSOP87, the Moon via ELP; the true sky for
   any date.
-- **All bodies** — 8 planets and 13 major moons (toggle the full system with `P`).
+- **All bodies** — 8 planets and 13 major moons (toggle the full system with `P`),
+  the Earth wrapped in a drifting procedural (fractal-noise) cloud layer.
 - **Three viewpoints** — top-down (Ecliptic-North), free orbit around any focus
   body, and the sky from a place on Earth (sidereal-time correct; default
   Zutphen).

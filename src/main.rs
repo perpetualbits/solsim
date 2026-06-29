@@ -116,13 +116,30 @@ const LOG_SIZE_BOOST: f32 = 6.0;
 const LOG_MIN_SIZE: f32 = 0.005;
 const LOG_MAX_SIZE: f32 = 0.12;
 
+/// How much larger than the planet the cloud shell is drawn.
+///
+/// What: the cloud sphere's radius as a multiple of the body radius.
+/// How/why: a thin shell just above the surface so clouds sit on the near side and
+/// blend over the planet; ~2% keeps a clear depth gap without an obvious halo.
+/// Units: dimensionless ratio.
+const CLOUD_ALTITUDE: f32 = 1.02;
+
+/// How much faster than the surface the clouds rotate.
+///
+/// What: the cloud layer's spin rate relative to the body's own rotation.
+/// How/why: a few percent faster makes the clouds slowly slip eastward over the
+/// surface (loosely, atmospheric super-rotation), so weather visibly drifts.
+/// Units: dimensionless ratio.
+const CLOUD_DRIFT: f64 = 1.03;
+
 /// Decode the body texture maps into the layers of the GPU texture array.
 ///
 /// What: builds one RGBA layer per body map, with a white layer 0 for untextured
 /// bodies.
 /// How/why: layer 0 is plain white so untextured bodies (small moons) show their
 /// solid colour tint; the embedded maps follow in [`render::textures::TEXTURES`]
-/// order, so `layer_of(name)` lines up with this list.
+/// order, so `layer_of(name)` lines up with this list. The last layer is the
+/// procedurally generated cloud map (`render::textures::cloud_layer`).
 /// Units: each layer is `TEX_W·TEX_H·4` bytes of RGBA.
 fn build_body_layers() -> Vec<Vec<u8>> {
     let white = vec![255u8; (render::textures::TEX_W * render::textures::TEX_H * 4) as usize];
@@ -130,6 +147,8 @@ fn build_body_layers() -> Vec<Vec<u8>> {
     for (_, bytes) in render::textures::TEXTURES {
         layers.push(render::textures::decode_rgba(bytes));
     }
+    // The procedural cloud layer, baked once with fractal (fBm) noise.
+    layers.push(render::clouds::bake_cloud_layer());
     layers
 }
 
@@ -980,6 +999,40 @@ impl App {
                 }
             })
             .collect();
+
+        // A translucent cloud shell over the Earth: a slightly larger sphere with
+        // the procedural fBm cloud map, rotating a touch faster than the surface so
+        // the weather visibly drifts. Skipped in log mode (which would distort it)
+        // and whenever the Earth itself is hidden (e.g. the surface view).
+        let mut cloud_instances: Vec<Instance> = Vec::new();
+        if !log && visible[EARTH_INDEX] {
+            let rel = (display(positions[EARTH_INDEX]) - origin_disp).as_vec3();
+            let earth_radius = if self.true_scale {
+                bodies::real_radius_au("Earth") as f32
+            } else {
+                BODIES[EARTH_INDEX].draw_radius_au
+            };
+            let (period, obliquity_deg) = bodies::rotation("Earth");
+            let spin = if period != 0.0 {
+                let obl = obliquity_deg.to_radians();
+                let axis = DVec3::new(0.0, obl.sin(), obl.cos()).normalize();
+                let angle = (std::f64::consts::TAU * (jd - astro::time::J2000)
+                    / (period / CLOUD_DRIFT))
+                    .rem_euclid(std::f64::consts::TAU);
+                [axis.x as f32, axis.y as f32, axis.z as f32, angle as f32]
+            } else {
+                [0.0, 0.0, 1.0, 0.0]
+            };
+            cloud_instances.push(Instance {
+                center: [rel.x, rel.y, rel.z],
+                radius: earth_radius * CLOUD_ALTITUDE,
+                color: [1.0, 1.0, 1.0],
+                emissive: 0.0,
+                tex_layer: render::textures::cloud_layer(),
+                spin,
+            });
+        }
+
         let (mut trail_vertices, mut trail_ranges) = self.trails.build(display, origin, &visible);
         let mut sun_pos = (DVec3::ZERO - origin_disp).as_vec3();
 
@@ -1114,6 +1167,7 @@ impl App {
             trail_ranges = Vec::new();
             line_segs = e.path_segments();
             ring_verts = Vec::new();
+            cloud_instances = Vec::new();
             arrows = e.arrows();
         }
         egui.state
@@ -1179,6 +1233,7 @@ impl App {
             star_view_proj,
             self.show_stars,
             &instances,
+            &cloud_instances,
             &trail_vertices,
             &trail_ranges,
             &line_segs,

@@ -118,6 +118,21 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let shade = ambient + (1.0 - ambient) * diffuse;
     return vec4<f32>(base * shade, 1.0);
 }
+
+// Cloud shell: like `fs`, but the texture's ALPHA is the cloud coverage, so the
+// fragment is translucent (alpha-blended over the planet) and lit by the Sun, so
+// clouds fade into the night side at the terminator.
+@fragment
+fn fs_cloud(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(body_tex, body_samp, in.uv, i32(in.layer));
+    let n = normalize(in.normal);
+    let l = normalize(globals.sun_pos - in.world);
+    let diffuse = max(dot(n, l), 0.0);
+    let ambient = 0.10;
+    let shade = ambient + (1.0 - ambient) * diffuse;
+    let col = texel.rgb * in.color * shade;
+    return vec4<f32>(col, texel.a);
+}
 "#;
 
 /// Generate a UV-sphere mesh (latitude/longitude grid).
@@ -235,10 +250,12 @@ fn upload_texture_array(
 /// Units: not applicable (GPU handles).
 pub struct BodyPass {
     pipeline: wgpu::RenderPipeline,
+    cloud_pipeline: wgpu::RenderPipeline,
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     index_count: u32,
     instance_buf: wgpu::Buffer,
+    cloud_instance_buf: wgpu::Buffer,
     instance_capacity: u32,
     tex_bind_group: wgpu::BindGroup,
 }
@@ -278,6 +295,14 @@ impl BodyPass {
         });
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("body instances"),
+            size: (instance_capacity as usize * std::mem::size_of::<Instance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // A second instance buffer for the translucent cloud shells (a handful of
+        // bodies, but sized like the body buffer for headroom).
+        let cloud_instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud instances"),
             size: (instance_capacity as usize * std::mem::size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -394,12 +419,64 @@ impl BodyPass {
             cache: None,
         });
 
+        // The cloud-shell pipeline: same mesh and vertex stage, but the `fs_cloud`
+        // fragment stage uses the texture's alpha as coverage, alpha-blends over the
+        // planet, and does not write depth (it is a thin translucent layer drawn
+        // after the solid bodies).
+        let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cloud pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &MESH_ATTRS,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &INSTANCE_ATTRS,
+                    },
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cloud"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
+            cloud_pipeline,
             vertex_buf,
             index_buf,
             index_count,
             instance_buf,
+            cloud_instance_buf,
             instance_capacity,
             tex_bind_group,
         }
@@ -438,6 +515,49 @@ impl BodyPass {
         pass.set_bind_group(1, &self.tex_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+        pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..self.index_count, 0, 0..count.min(self.instance_capacity));
+    }
+
+    /// Copy this frame's translucent cloud-shell records into their buffer.
+    ///
+    /// What: uploads the per-shell positions/sizes/layers to the GPU.
+    /// How/why: a separate instance buffer from the solid bodies, since the cloud
+    /// shells are drawn with a different (alpha-blended) pipeline.
+    /// Units: see [`Instance`].
+    pub fn upload_clouds(&self, queue: &wgpu::Queue, instances: &[Instance]) {
+        let count = (instances.len() as u32).min(self.instance_capacity) as usize;
+        if count == 0 {
+            return;
+        }
+        queue.write_buffer(
+            &self.cloud_instance_buf,
+            0,
+            bytemuck::cast_slice(&instances[..count]),
+        );
+    }
+
+    /// Record the draw command for the translucent cloud shells.
+    ///
+    /// What: draws `count` slightly-enlarged spheres, alpha-blended over the bodies.
+    /// How/why: same mesh as the bodies, but the cloud pipeline reads the texture's
+    /// alpha as coverage and does not write depth, so the clouds layer correctly
+    /// over the already-drawn planet. Call this after the solid bodies.
+    /// Units: `count` is a number of cloud shells.
+    pub fn record_clouds<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        globals: &'p wgpu::BindGroup,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.cloud_pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        pass.set_bind_group(1, &self.tex_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+        pass.set_vertex_buffer(1, self.cloud_instance_buf.slice(..));
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..self.index_count, 0, 0..count.min(self.instance_capacity));
     }

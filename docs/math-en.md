@@ -387,6 +387,35 @@ positions; the generated band's mean |galactic latitude| stays small (unit tests
 
 ---
 
+## 14. Procedural clouds (fractal noise) — `render/clouds.rs`, `render/sphere.rs`
+
+Clouds look the same at many scales, so they are a perfect fit for **fractional
+Brownian motion (fBm)**: add several octaves of smooth value noise, each at twice
+the frequency and half the strength of the one before. A handful of octaves gives a
+rich, self-similar field — and it is cheap, because we bake it once into a texture
+at start-up.
+
+```
+fbm(p) = Σᵢ amplitudeᵢ · noise(2ⁱ·p),   amplitudeᵢ = ½ⁱ
+```
+
+We sample the noise on the **unit sphere** (each pixel's 3-D direction) so the map
+wraps seamlessly and does not pinch at the poles, swirl it with a **domain warp**
+(offset the sample point by a second noise field) for wind-sheared streaks, and turn
+the fBm value into a soft coverage with `smoothstep`. That coverage is stored as the
+texture's alpha.
+
+The Earth then gets a thin translucent **cloud shell**: a sphere ~2% larger than the
+planet, drawn after the solid bodies with alpha blending and no depth writing, lit by
+the same Sun (so clouds fade at the terminator) and spun a few percent faster than
+the surface so the weather drifts. It is hidden only when the Earth itself is (log
+mode, or the surface view where you stand on it).
+
+**Checks:** value noise and fBm stay in 0..1; the baked map contains both clear sky
+and solid cloud (unit tests).
+
+---
+
 ### Source-file map
 
 | Topic | File |
@@ -402,6 +431,7 @@ positions; the generated band's mean |galactic latitude| stays small (unit tests
 | Star colours & sizes | `stars/color.rs` |
 | Star placement | `stars/project.rs`, `render/starfield.rs` |
 | Milky Way band, galactic coordinates | `stars/galaxy.rs`, `stars/project.rs` |
+| Procedural clouds (fBm) | `render/clouds.rs`, `render/sphere.rs` |
 | Orbit camera | `render/camera.rs` |
 | Viewpoints, sidereal time | `render/viewpoints.rs` |
 | Reference grid | `render/grid.rs` |

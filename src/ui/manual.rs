@@ -17,7 +17,8 @@ const SECTIONS: &[(&str, &str)] = &[
 centre; the planets orbit it, and moons orbit the planets. Distances are measured \
 in astronomical units (AU): 1 AU is the average Earth–Sun distance. Bodies are \
 drawn far larger than reality so you can see them — otherwise they would be \
-invisible dots. Their positions, however, are real.",
+invisible dots. Their positions, however, are real. The Earth is wrapped in a \
+drifting cloud layer made from fractal noise (see docs/math-en.md, section 14).",
     ),
     (
         "Viewpoints and controls",
