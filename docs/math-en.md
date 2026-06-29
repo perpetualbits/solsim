@@ -1,5 +1,7 @@
 # The Maths & Physics of the Solar System Simulator
 
+*A Dutch translation is available in [`math-nl.md`](math-nl.md).*
+
 This is the complete reference for every formula, algorithm and physical principle
 the program uses, with pointers to the source file where each lives. It is written
 for a Dutch **4 VWO** reader (≈ age 15–16): plain Unicode maths, every symbol
@@ -145,6 +147,9 @@ This cancels low-order error so orbits stay accurate with large steps. Each fram
 time step is **subdivided** (≈ 0.5-day sub-steps) for accuracy; the analytic engine
 is subdivided too, so fast inner planets trace smooth orbits instead of jagged
 chords (temporal aliasing). See `main.rs` (`PHYSICS_STEP_DAYS`, `TRAIL_STEP_DAYS`).
+The step *size* is bounded to `PHYSICS_STEP_DAYS` (`nbody::plan_substeps`) so that
+short-period orbits cannot blow up no matter how fast time is requested; at extreme
+speed the clock falls behind (with a HUD note) rather than coarsening the step.
 
 ## 6. Stars — `stars/color.rs`, `stars/project.rs`
 

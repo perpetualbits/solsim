@@ -2,7 +2,7 @@
 //!
 //! A gravitating system has two kinds of energy: the *kinetic* energy of motion
 //! and the *potential* energy stored in the pull of gravity. Newton's laws (and,
-//! more deeply, the Hamiltonian — see `docs/MATHS.md`) guarantee that for a closed
+//! more deeply, the Hamiltonian — see `docs/math-en.md`) guarantee that for a closed
 //! system their **sum is constant** over time. So plotting the sum is a built-in
 //! honesty check on the simulation: a flat line means the integrator conserves
 //! energy; a drifting line reveals numerical error (or the exaggerated GR term,

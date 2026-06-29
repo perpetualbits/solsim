@@ -37,4 +37,5 @@ Use Meeus "Astronomical Algorithms" example values where available.
 ## Style
 - Small modules per the agreed layout. One responsibility each.
 - Prefer pure functions for maths; keep GPU/state separate from physics.
-- Update the on-screen controls help and `docs/MATHS.md` whenever behaviour changes.
+- Update the on-screen controls help and `docs/math-en.md` (and keep its Dutch
+  translation `docs/math-nl.md` in sync) whenever behaviour changes.

@@ -2,7 +2,7 @@
 //!
 //! The text is written for a Dutch 4-VWO reader (≈ age 15–16): short paragraphs,
 //! plain Unicode maths, every symbol explained. It mirrors the deeper reference in
-//! `docs/MATHS.md`.
+//! `docs/math-en.md`.
 
 /// The manual's sections, as `(title, body)` pairs shown in order.
 ///
@@ -130,7 +130,7 @@ simulation drifting: bigger time steps and the exaggerated relativity term both 
 break perfect conservation, which is exactly why the graph is worth watching. \
 There is also the virial theorem: averaged over an orbit, 2·KE + PE = 0, so a \
 bound orbit always has more negative potential than positive kinetic energy. See \
-docs/MATHS.md for how the equations of motion follow from this energy (the \
+docs/math-en.md for how the equations of motion follow from this energy (the \
 Hamiltonian).",
     ),
     (

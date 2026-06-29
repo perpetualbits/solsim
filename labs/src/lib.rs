@@ -148,7 +148,7 @@ pub fn rk4_step(r: DVec3, v: DVec3, gm: f64, dt: f64) -> (DVec3, DVec3) {
 /// a built-in check on the simulation (see the energy graph, key `Y`, in the app).
 /// Principle: conservation of energy; together with the virial theorem
 /// (`2·KE + PE = 0` for a circular orbit) this is one of the deepest ideas in
-/// mechanics — see `../docs/MATHS.md`.
+/// mechanics — see `../docs/math-en.md`.
 /// Units: `mass` in solar masses, `r` in AU, `v` in AU·day⁻¹, `gm_sun` (= G·M) in
 /// AU³·day⁻²; energies in M_sun·AU²·day⁻².
 pub fn energies(mass: f64, r: DVec3, v: DVec3, gm_sun: f64) -> (f64, f64) {

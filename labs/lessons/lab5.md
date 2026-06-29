@@ -40,7 +40,7 @@ goed zijn.
 
 Het volledige verhaal — hoe de bewegingsvergelijkingen zelf uit de energie volgen
 (de **Hamiltoniaan**), en een nette afleiding van het viriaaltheorema — staat in
-[`../docs/MATHS.md`](../docs/MATHS.md), paragraaf 12.
+[`../docs/math-nl.md`](../docs/math-nl.md), paragraaf 12.
 
 ➡️ **Volgende:** [Practicum 6 — een planeet op zijn ellips vinden (vergelijking van
 Kepler)](lab6.md).

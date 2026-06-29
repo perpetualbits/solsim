@@ -59,4 +59,5 @@ Everything you write here has a twin in the main project, so your work transfers
 | `perihelion_advance_arcsec_per_century` | the GR check in `src/physics/forces.rs` |
 
 The deeper maths (RK4, the energy/Hamiltonian, the virial theorem, Kepler's
-equation) is written up for you in [`../docs/MATHS.md`](../docs/MATHS.md).
+equation) is written up for you in [`../docs/math-en.md`](../docs/math-en.md)
+([Nederlands](../docs/math-nl.md)).

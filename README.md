@@ -94,9 +94,9 @@ All astronomy/physics runs in `f64` (AU, days, radians), converted to `f32` only
 at the GPU boundary using a camera-centred floating origin. The full reference —
 Julian dates, VSOP87, the ecliptic frame, Kepler's equation, Newtonian N-body,
 RK4, the 1PN GR term with the 43″/century derivation, star colours, the cameras
-and the logarithmic transform — is in [`docs/MATHS.md`](docs/MATHS.md), with each
-topic cross-referenced to its source file. The in-app manual (`F1`) is the short
-version.
+and the logarithmic transform — is in [`docs/math-en.md`](docs/math-en.md)
+([Nederlands](docs/math-nl.md)), with each topic cross-referenced to its source
+file. The in-app manual (`F1`) is the short version.
 
 ## Tests
 
