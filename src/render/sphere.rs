@@ -169,12 +169,15 @@ fn generate_uv_sphere(sectors: u32, rings: u32) -> (Vec<Vertex>, Vec<u16>) {
         for s in 0..sectors {
             let a = r * stride + s;
             let b = a + stride;
+            // Wound so the outward-facing side is the front face (counter-clockwise
+            // seen from outside), so back-face culling keeps the near hemisphere we
+            // actually look at — not the inside of the far one.
             indices.push(a as u16);
-            indices.push(b as u16);
-            indices.push((a + 1) as u16);
             indices.push((a + 1) as u16);
             indices.push(b as u16);
+            indices.push((a + 1) as u16);
             indices.push((b + 1) as u16);
+            indices.push(b as u16);
         }
     }
 
@@ -444,13 +447,10 @@ impl BodyPass {
                 ],
             },
             primitive: wgpu::PrimitiveState {
-                // No back-face culling. The cloud shell is a thin sphere drawn over
-                // the planet; with back-face culling its camera-facing hemisphere was
-                // being dropped and only the far side (poking past the planet's
-                // silhouette) showed, as a thin rim. Drawing both faces lets the
-                // near hemisphere appear over the planet; the far hemisphere is
-                // depth-rejected there and only adds a faint edge at the limb.
-                cull_mode: None,
+                // Same back-face culling as the bodies: the now-correct winding
+                // keeps the near (camera-facing) hemisphere of the shell, which
+                // draws over the planet, and culls the far one (no rim double-blend).
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
