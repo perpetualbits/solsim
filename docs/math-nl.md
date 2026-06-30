@@ -442,6 +442,82 @@ heldere hemel als dichte bewolking (unittests).
 
 ---
 
+## 15. De drie wetten van Kepler, afgeleid — `astro/elements.rs`, de oppervlakte-demo (toets `J`)
+
+Kepler vond zijn drie wetten door naar *data te staren*; Newton liet later zien dat
+ze allemaal volgen uit één kwadratenkracht. Hier is de korte versie, op een niveau
+dat je kunt volgen.
+
+### Kepler's tweede wet — gelijke oppervlakten in gelijke tijden (de makkelijkste, dus eerst)
+
+In een kleine tijd `Δt` beweegt de planeet over `v⃗·Δt`. De dunne driehoek die de
+lijn zon–planeet `r⃗` veegt heeft oppervlakte
+
+```
+ΔA = ½·|r⃗ × v⃗·Δt| = ½·|r⃗ × v⃗|·Δt      ⇒   dA/dt = ½·|r⃗ × v⃗|
+```
+
+Breng nu het **impulsmoment** `L⃗ = m·(r⃗ × v⃗)` in beeld, zodat `dA/dt = |L⃗| / (2m)`.
+De zwaartekracht is een **centrale** kracht: hij wijst recht langs `r⃗`, naar de zon
+toe. Het draai-effect (het moment) is `τ⃗ = r⃗ × F⃗`, en omdat `F⃗` evenwijdig is aan
+`r⃗`, is dat uitproduct **nul**. Geen moment betekent dat `L⃗` nooit verandert — het
+blijft behouden. Dus
+
+```
+dA/dt = |L⃗| / (2m) = constant.
+```
+
+De voerstraal veegt oppervlakte met een *vaste snelheid* — gelijke oppervlakten in
+gelijke tijden. Dat is de hele wet: het is behoud van impulsmoment. Een gevolg: waar
+de planeet dicht bij de zon is (`|r⃗|` klein) moet hij snel bewegen, en ver weg
+kruipt hij, zodat de dun-lange taartpunt bij het perihelium dezelfde oppervlakte
+heeft als de dik-korte bij het aphelium. Druk op `J` om dit te zien op de echte baan
+van de gekozen planeet.
+
+### Kepler's derde wet — `T² ∝ a³`
+
+Neem een cirkelbaan (bij de ellips vervang je `r` gewoon door de halve lange as `a`).
+De zwaartekracht levert precies de middelpuntzoekende kracht die de baan kromt:
+
+```
+G·M·m / r²  =  m·v² / r      ⇒   v² = G·M / r
+```
+
+De planeet legt één omtrek `2π·r` af in één periode `T`, dus `v = 2π·r / T`. Invullen:
+
+```
+(2π·r / T)² = G·M / r   ⇒   4π²·r² / T² = G·M / r   ⇒   T² = (4π² / G·M)·r³
+```
+
+Dus `T² = (4π²/GM)·a³` voor een ellips met halve lange as `a`. De factor `4π²/GM` is
+voor **elke planeet** rond de zon **hetzelfde**, dus `T²/a³` is een gedeelde
+constante — dat is precies Kepler's derde wet, en het is waarom de buitenste
+planeten zoveel trager zijn.
+
+### Kepler's eerste wet — de baan is een ellips
+
+Deze kost het meeste werk, dus we geven het resultaat en het idee. Het oplossen van
+de bewegingsvergelijking voor een kwadraten-centrale-kracht (door de behouden
+energie en het impulsmoment te combineren) geeft de baanvorm
+
+```
+r(θ) = p / (1 + e·cos θ),
+```
+
+de vergelijking van een **kegelsnede** met de zon in één brandpunt. Voor een gebonden
+baan is de excentriciteit `0 ≤ e < 1`, en die kegelsnede is een **ellips** (`e = 0`
+is de cirkel). De excentriciteit wordt bepaald door de energie: meer negatieve
+totale energie → rondere baan. Het is bijzonder aan de `1/r²`-wet dat de ellips zich
+*sluit* in plaats van langzaam te draaien — de kleine correctie uit de algemene
+relativiteitstheorie (§5) breekt dat en laat de ellips precesseren, wat Mercurius'
+43″/eeuw is.
+
+Deze simulator gebruikt de wetten op beide manieren: de manen worden *geplaatst* met
+Kepler-elementen (§4), en de geïntegreerde motor (§5) *reproduceert* de wetten uit de
+kracht — je kunt de gelijke oppervlakten van de tweede wet live bevestigen met `J`.
+
+---
+
 ### Overzicht van bronbestanden
 
 | Onderwerp | Bestand |
@@ -454,6 +530,7 @@ heldere hemel als dichte bewolking (unittests).
 | Newtoniaanse + GR-krachten | `physics/forces.rs` |
 | RK4-integrator, toestand | `physics/nbody.rs` |
 | Energie, Hamiltoniaan, viriaal | `physics/energy.rs`, `ui/energy.rs` |
+| Afleidingen wetten van Kepler, oppervlakte-demo | `main.rs`, `render/areas.rs` |
 | Sterrenkleuren & -groottes | `stars/color.rs` |
 | Plaatsing van sterren | `stars/project.rs`, `render/starfield.rs` |
 | Band van de Melkweg, galactische coördinaten | `stars/galaxy.rs`, `stars/project.rs` |

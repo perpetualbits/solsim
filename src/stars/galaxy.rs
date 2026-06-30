@@ -255,12 +255,16 @@ const NEIGHBORS: &[Neighbor] = &[
 /// Gaussian cloud of faint additive points mimics that soft elliptical glow.
 /// Units: directions are unit vectors; sizes in pixels; colours linear RGB.
 pub fn neighbor_galaxies() -> Vec<StarInstance> {
-    let mut rng = Rng::new(0x1CE_A11_DEAD_BEEF);
+    let mut rng = Rng::new(0x001C_EA11_DEAD_BEEF);
     let mut out = Vec::new();
     for g in NEIGHBORS {
         let d0 = radec_to_ecliptic(g.ra_deg, g.dec_deg);
         // Two unit tangents on the sky at the galaxy's centre.
-        let helper = if d0.z.abs() < 0.95 { DVec3::Z } else { DVec3::X };
+        let helper = if d0.z.abs() < 0.95 {
+            DVec3::Z
+        } else {
+            DVec3::X
+        };
         let e1 = (helper - d0 * helper.dot(d0)).normalize();
         let e2 = d0.cross(e1);
 
@@ -271,7 +275,7 @@ pub fn neighbor_galaxies() -> Vec<StarInstance> {
         for _ in 0..g.points {
             let u = rng.gaussian(); // along the major axis (in σ units)
             let v = rng.gaussian(); // along the minor axis
-            // Place the point, rotating the ellipse by the position angle.
+                                    // Place the point, rotating the ellipse by the position angle.
             let a1 = sigma_major * (u * cp) - sigma_minor * (v * sp);
             let a2 = sigma_major * (u * sp) + sigma_minor * (v * cp);
             let dir = (d0 + e1 * a1 + e2 * a2).normalize();
@@ -416,8 +420,7 @@ mod tests {
         let stars = neighbor_galaxies();
         assert_eq!(stars.len(), total);
         for s in &stars {
-            let len =
-                (s.dir[0] * s.dir[0] + s.dir[1] * s.dir[1] + s.dir[2] * s.dir[2]).sqrt();
+            let len = (s.dir[0] * s.dir[0] + s.dir[1] * s.dir[1] + s.dir[2] * s.dir[2]).sqrt();
             assert!((len - 1.0).abs() < 1e-4, "len = {len}");
         }
 
@@ -430,6 +433,9 @@ mod tests {
             let sep = d.dot(center).clamp(-1.0, 1.0).acos().to_degrees();
             max_sep = max_sep.max(sep);
         }
-        assert!(max_sep < 15.0, "M31 points stray {max_sep}° from its centre");
+        assert!(
+            max_sep < 15.0,
+            "M31 points stray {max_sep}° from its centre"
+        );
     }
 }

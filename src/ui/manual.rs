@@ -79,6 +79,16 @@ exaggerate the effect (gr-strength); the orbit's trail then draws a 'rosette' yo
 can watch form, while the Newtonian engine keeps a closed ellipse.",
     ),
     (
+        "Kepler's second law: equal areas",
+        "Press J (with a planet in focus, best in the top-down view) to see Kepler's \
+second law. The line from the Sun to the planet sweeps out the shaded wedges; one \
+wedge is filled for each equal slice of time. They look very different — thin and \
+long near the Sun, fat and short far away — yet every wedge has the SAME area. That \
+is because the planet speeds up when it is close to the Sun and slows down when far, \
+in just the right way. It is really conservation of angular momentum; the full \
+reasoning is in docs/math-en.md, section 15.",
+    ),
+    (
         "Moons: Kepler's equation",
         "Most moons here follow simple average ('mean') orbits. An orbit is an \
 ellipse (Kepler's first law), and a body speeds up when it is closer to its planet \

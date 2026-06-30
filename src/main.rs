@@ -559,6 +559,7 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 ui.label("S — body size: real ↔ exaggerated");
                 ui.label("K — educational mode (vector walkthrough)");
                 ui.label("Y — energy graph (kinetic / potential / total)");
+                ui.label("J — Kepler equal-area sweep (focus a planet; top-down view)");
                 ui.label("E / N / G — engine: Ephemeris / Newtonian / GR");
                 ui.label("[  /  ]  — GR strength ÷10 / ×10");
                 ui.label("F1 / H — open the manual");
@@ -641,6 +642,8 @@ struct App {
     manual_search: String,
     show_energy: bool,
     energy_hist: std::collections::VecDeque<ui::energy::Sample>,
+    /// Whether the Kepler's-second-law equal-area sweep is shown for the focus.
+    show_kepler: bool,
     /// True when the integrated engine could not keep up this frame and time was
     /// held back to protect orbit accuracy (shown as a HUD warning).
     physics_speed_limited: bool,
@@ -712,6 +715,7 @@ impl App {
             manual_search: String::new(),
             show_energy: false,
             energy_hist: std::collections::VecDeque::new(),
+            show_kepler: false,
             physics_speed_limited: false,
             edu: None,
             screenshot_requested: false,
@@ -1099,6 +1103,78 @@ impl App {
                 });
             }
         }
+        // Kepler's second law: shade the equal-area sectors that the Sun–planet
+        // line sweeps in equal time intervals over one orbit of the focused planet.
+        // Skipped in log mode and unless a planet (not the Sun or a moon) is focused.
+        let mut area_verts: Vec<render::areas::AreaVertex> = Vec::new();
+        if self.show_kepler && !log {
+            let fi = self.focus_index;
+            if (1..=bodies::PLANETS.len()).contains(&fi) {
+                let planet = bodies::PLANETS[fi - 1];
+                let r = positions[fi];
+                let v = astro::ephemeris::velocity_fd(
+                    |t| astro::ephemeris::planet_position(planet, t),
+                    jd,
+                    1.0 / 32.0,
+                );
+                let mu = astro::constants::GM_SUN;
+                // Semi-major axis from the vis-viva relation, then the period.
+                let a = 1.0 / (2.0 / r.length() - v.length_squared() / mu);
+                if a.is_finite() && a > 0.0 {
+                    let period = std::f64::consts::TAU * (a * a * a / mu).sqrt();
+                    const SECTORS: usize = 12;
+                    const SUB: usize = 10; // arc steps per sector
+                    let total = SECTORS * SUB;
+                    let sample = |k: usize| {
+                        astro::ephemeris::planet_position(
+                            planet,
+                            jd + period * (k as f64) / (total as f64),
+                        )
+                    };
+                    let to_v = |p: DVec3, c: [f32; 4]| {
+                        let q = (p - origin).as_vec3();
+                        render::areas::AreaVertex {
+                            pos: [q.x, q.y, q.z],
+                            color: c,
+                        }
+                    };
+                    // Alternating shades make neighbouring (equal-area) sectors stand
+                    // apart; the Sun sits at the heliocentric origin.
+                    let fill_a = [0.30, 0.55, 0.95, 0.16];
+                    let fill_b = [0.95, 0.65, 0.25, 0.16];
+                    let orbit_col = [0.55, 0.65, 0.85, 0.8];
+                    let spoke_col = [1.0, 0.85, 0.35, 0.9];
+                    for s in 0..SECTORS {
+                        let fill = if s % 2 == 0 { fill_a } else { fill_b };
+                        for j in 0..SUB {
+                            let p0 = sample(s * SUB + j);
+                            let p1 = sample(s * SUB + j + 1);
+                            // Triangle Sun–p0–p1 fills a thin slice of the wedge.
+                            area_verts.push(to_v(DVec3::ZERO, fill));
+                            area_verts.push(to_v(p0, fill));
+                            area_verts.push(to_v(p1, fill));
+                            // The orbit arc itself.
+                            line_segs.push(LineSeg {
+                                a: p0,
+                                b: p1,
+                                color: orbit_col,
+                                width: 1.5,
+                                fade: false,
+                            });
+                        }
+                        // The radius vector (spoke) at the start of this sector.
+                        line_segs.push(LineSeg {
+                            a: DVec3::ZERO,
+                            b: sample(s * SUB),
+                            color: spoke_col,
+                            width: 1.5,
+                            fade: false,
+                        });
+                    }
+                }
+            }
+        }
+
         for s in &mut line_segs {
             s.a -= origin;
             s.b -= origin;
@@ -1204,6 +1280,7 @@ impl App {
             line_segs = e.path_segments();
             ring_verts = Vec::new();
             cloud_instances = Vec::new();
+            area_verts = Vec::new();
             arrows = e.arrows();
         }
         egui.state
@@ -1274,6 +1351,7 @@ impl App {
             &trail_ranges,
             &line_segs,
             &ring_verts,
+            &area_verts,
             &arrows,
         );
 
@@ -1526,6 +1604,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         "y" => self.show_energy = !self.show_energy,
+                        "j" => self.show_kepler = !self.show_kepler,
                         "q" => event_loop.exit(),
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,

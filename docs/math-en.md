@@ -416,6 +416,78 @@ and solid cloud (unit tests).
 
 ---
 
+## 15. Kepler's three laws, derived — `astro/elements.rs`, the area demo (key `J`)
+
+Kepler found his three laws by *staring at data*; Newton later showed they all fall
+out of one inverse-square force. Here is the short version, at a level you can follow.
+
+### Kepler's second law — equal areas in equal times (the easiest, so first)
+
+In a small time `Δt` the planet moves by `v⃗·Δt`. The thin triangle swept by the
+Sun–planet line `r⃗` has area
+
+```
+ΔA = ½·|r⃗ × v⃗·Δt| = ½·|r⃗ × v⃗|·Δt      ⇒   dA/dt = ½·|r⃗ × v⃗|
+```
+
+Now bring in **angular momentum** `L⃗ = m·(r⃗ × v⃗)`, so `dA/dt = |L⃗| / (2m)`.
+Gravity is a **central** force: it points straight along `r⃗`, toward the Sun. The
+turning effect (torque) is `τ⃗ = r⃗ × F⃗`, and since `F⃗` is parallel to `r⃗`, that
+cross product is **zero**. No torque means `L⃗` never changes — it is conserved. So
+
+```
+dA/dt = |L⃗| / (2m) = constant.
+```
+
+The radius vector sweeps area at a *fixed rate* — equal areas in equal times. That is
+the whole law: it is conservation of angular momentum. A consequence: where the
+planet is close to the Sun (`|r⃗|` small) it must move fast, and far away it crawls,
+so the thin-long wedge near perihelion has the same area as the fat-short wedge near
+aphelion. Press `J` to watch this on the focused planet's real orbit.
+
+### Kepler's third law — `T² ∝ a³`
+
+Take a circular orbit (the ellipse case just swaps `r` for the semi-major axis `a`).
+Gravity supplies exactly the centripetal force needed to curve the path:
+
+```
+G·M·m / r²  =  m·v² / r      ⇒   v² = G·M / r
+```
+
+The planet covers one circumference `2π·r` in one period `T`, so `v = 2π·r / T`.
+Substitute:
+
+```
+(2π·r / T)² = G·M / r   ⇒   4π²·r² / T² = G·M / r   ⇒   T² = (4π² / G·M)·r³
+```
+
+So `T² = (4π²/GM)·a³` for an ellipse of semi-major axis `a`. The factor `4π²/GM` is
+the **same for every planet** round the Sun, so `T²/a³` is a shared constant — that
+is exactly Kepler's third law, and it is why the outer planets are so much slower.
+
+### Kepler's first law — the orbit is an ellipse
+
+This one needs the most work, so we state the result and the idea. Solving the
+equation of motion for an inverse-square central force (combining the conserved
+energy and angular momentum) gives the orbit shape
+
+```
+r(θ) = p / (1 + e·cos θ),
+```
+
+the equation of a **conic section** with the Sun at one focus. For a bound orbit the
+eccentricity `0 ≤ e < 1`, and that conic is an **ellipse** (`e = 0` is the circle).
+The eccentricity is set by the energy: more negative total energy → rounder orbit.
+It is special to the `1/r²` law that the ellipse *closes* on itself instead of slowly
+turning — the tiny General-Relativity correction (§5) breaks that and makes the
+ellipse precess, which is Mercury's 43″/century.
+
+This simulator uses the laws both ways: the moons are *placed* from Kepler elements
+(§4), and the integrated engine (§5) *reproduces* the laws from the force — you can
+confirm the second law's equal areas live with `J`.
+
+---
+
 ### Source-file map
 
 | Topic | File |
@@ -428,6 +500,7 @@ and solid cloud (unit tests).
 | Newtonian + GR forces | `physics/forces.rs` |
 | RK4 integrator, state | `physics/nbody.rs` |
 | Energy, Hamiltonian, virial | `physics/energy.rs`, `ui/energy.rs` |
+| Kepler's-law derivations, equal-area demo | `main.rs`, `render/areas.rs` |
 | Star colours & sizes | `stars/color.rs` |
 | Star placement | `stars/project.rs`, `render/starfield.rs` |
 | Milky Way band, galactic coordinates | `stars/galaxy.rs`, `stars/project.rs` |

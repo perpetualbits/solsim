@@ -6,6 +6,7 @@
 //! Keeping all the GPU plumbing here leaves the maths modules (camera, ephemeris)
 //! free of graphics code, as the house rules ask.
 
+pub mod areas;
 pub mod arrows;
 pub mod camera;
 pub mod clouds;
@@ -22,6 +23,7 @@ pub mod viewpoints;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
+use areas::{AreaPass, AreaVertex};
 use arrows::{ArrowInstance, ArrowPass};
 use grid::{LinePass, LineSeg};
 use rings::{RingPass, RingVertex};
@@ -32,6 +34,9 @@ use trails::{TrailPass, TrailVertex};
 /// Maximum number of line *segments* the line pass can draw in one frame
 /// (the adaptive 3-D grid across all levels, plus the horizon).
 const LINE_CAPACITY: u32 = 16384;
+
+/// Maximum number of area-shading vertices per frame (the Kepler sweep sectors).
+const AREA_CAPACITY: u32 = 8192;
 
 /// Camera/scene data shared by every shader, as one uniform block.
 ///
@@ -66,6 +71,7 @@ pub struct Scene {
     star_pass: StarfieldPass,
     ring_pass: RingPass,
     arrow_pass: ArrowPass,
+    area_pass: AreaPass,
 }
 
 impl Scene {
@@ -144,6 +150,13 @@ impl Scene {
         let star_pass = StarfieldPass::new(device, color_format, depth_format, stars);
         let ring_pass = RingPass::new(device, queue, &globals_layout, color_format, depth_format);
         let arrow_pass = ArrowPass::new(device, &globals_layout, color_format, depth_format, 64);
+        let area_pass = AreaPass::new(
+            device,
+            &globals_layout,
+            color_format,
+            depth_format,
+            AREA_CAPACITY,
+        );
 
         Self {
             globals_buf,
@@ -154,6 +167,7 @@ impl Scene {
             star_pass,
             ring_pass,
             arrow_pass,
+            area_pass,
         }
     }
 
@@ -185,6 +199,7 @@ impl Scene {
         trail_ranges: &[(u32, u32)],
         line_segs: &[LineSeg],
         ring_verts: &[RingVertex],
+        area_verts: &[AreaVertex],
         arrow_instances: &[ArrowInstance],
     ) {
         let globals = Globals {
@@ -200,6 +215,7 @@ impl Scene {
         self.trail_pass.upload(queue, trail_vertices);
         self.line_pass.upload(queue, line_segs);
         self.ring_pass.upload(queue, ring_verts);
+        self.area_pass.upload(queue, area_verts);
         self.arrow_pass.upload(queue, arrow_instances);
         if show_stars {
             self.star_pass.update(queue, star_view_proj, viewport);
@@ -253,6 +269,9 @@ impl Scene {
         // Saturn's rings are translucent, so they come after the solid bodies.
         self.ring_pass
             .record(&mut pass, &self.globals_bind_group, ring_verts.len() as u32);
+        // Kepler equal-area sectors (translucent diagram overlay).
+        self.area_pass
+            .record(&mut pass, &self.globals_bind_group, area_verts.len() as u32);
         // Vector arrows (educational mode) draw last, always on top.
         self.arrow_pass.record(
             &mut pass,
