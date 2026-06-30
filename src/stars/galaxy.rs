@@ -14,10 +14,11 @@ use crate::stars::project::galactic_to_ecliptic;
 /// How many faint stars make up the band.
 ///
 /// What: the size of the procedural Milky Way point cloud.
-/// How/why: more points give a smoother glow; a few thousand is plenty and costs
-/// nothing to draw. Bumping this thickens and brightens the band evenly.
+/// How/why: more points give a smoother, denser glow (the band is the overlap of
+/// many faint dots); tens of thousands cost nothing to draw. Bumping this thickens
+/// and brightens the band evenly.
 /// Units: a count.
-const BAND_STAR_COUNT: usize = 9000;
+const BAND_STAR_COUNT: usize = 30_000;
 
 /// Vertical spread of the band, as the Gaussian σ of galactic latitude `b`.
 ///
@@ -31,20 +32,23 @@ const BAND_LATITUDE_SIGMA_DEG: f64 = 6.0;
 ///
 /// What: the dim end (toward the anticentre) and bright end (toward the bulge) of
 /// each band star's colour.
-/// How/why: kept far below the catalogue stars (~1.0) so the band reads as a
+/// How/why: kept well below the catalogue stars (~1.0) so the band reads as a
 /// diffuse glow, not as competing points; the bulge near the Galactic Centre is a
-/// touch brighter than the outer arms.
+/// touch brighter than the outer arms. With additive blending many of these sum up
+/// in the dense band.
 /// Units: linear-RGB brightness (dimensionless).
-const BAND_MIN_BRIGHT: f64 = 0.05;
-const BAND_MAX_BRIGHT: f64 = 0.14;
+const BAND_MIN_BRIGHT: f64 = 0.10;
+const BAND_MAX_BRIGHT: f64 = 0.22;
 
 /// Smallest and largest drawn dot size for a band star.
 ///
-/// What: the pixel-size range of the faint band stars.
-/// How/why: small, so the band is grainy-soft rather than a field of obvious dots.
+/// What: the pixel-size range of the band stars.
+/// How/why: must be ≳ 1 px or the sprite falls between pixels and renders nothing;
+/// kept just under the catalogue's smallest star (`MIN_SIZE` = 3.6 px) so the band
+/// reads as fainter, softer background haze, with many overlapping into a glow.
 /// Units: pixels.
-const BAND_SIZE_MIN: f64 = 0.8;
-const BAND_SIZE_MAX: f64 = 1.7;
+const BAND_SIZE_MIN: f64 = 2.4;
+const BAND_SIZE_MAX: f64 = 3.4;
 
 /// Build the faint star cloud that forms the Milky Way band.
 ///
