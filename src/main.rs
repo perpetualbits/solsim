@@ -185,9 +185,10 @@ fn build_star_instances() -> Vec<StarInstance> {
             }
         })
         .collect();
-    // The Milky Way: many faint stars hugging the galactic plane (key `B` hides
-    // the whole star background, this band included).
+    // The Milky Way band and the neighbour galaxies (Andromeda, the Magellanic
+    // Clouds, …) — all faint stars on the same background (key `B` hides them too).
     instances.extend(stars::galaxy::milky_way_band());
+    instances.extend(stars::galaxy::neighbor_galaxies());
     instances
 }
 

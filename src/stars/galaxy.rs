@@ -1,18 +1,23 @@
-//! The procedural Milky Way band.
+//! Our galaxy's band, plus the nearest neighbour galaxies.
 //!
 //! We cannot place a galaxy at its true distance — the nearest star is already
 //! ~270 000 AU away and the galaxy is billions of AU across — so, like the
-//! catalogue stars, the Milky Way is painted on the sky as *directions* only. We
+//! catalogue stars, galaxies are painted on the sky as *directions* only. We
 //! scatter many faint background stars whose density is concentrated along the
 //! galactic plane (a Gaussian in galactic latitude `b`), so that on the dark sky
 //! their overlapping glows add up (the starfield uses additive blending) into the
 //! soft band you see edge-on from inside our own galaxy's disk.
+//!
+//! The neighbour galaxies (Andromeda, the Magellanic Clouds, …) are made the same
+//! way: each is a small Gaussian cloud of faint stars in an oriented ellipse at the
+//! galaxy's real sky position, so it reads as a fuzzy elongated smudge that grows as
+//! you zoom toward it.
 
 use glam::DVec3;
 
 use crate::noise::fbm;
 use crate::render::starfield::StarInstance;
-use crate::stars::project::galactic_to_ecliptic;
+use crate::stars::project::{galactic_to_ecliptic, radec_to_ecliptic};
 
 /// How many faint stars make up the band.
 ///
@@ -157,6 +162,141 @@ pub fn milky_way_band() -> Vec<StarInstance> {
     out
 }
 
+/// Drawn-dot size range (pixels) for a neighbour-galaxy star.
+const NEIGHBOR_SIZE_MIN: f64 = 2.2;
+const NEIGHBOR_SIZE_MAX: f64 = 3.2;
+
+/// One neighbouring galaxy, as a fuzzy elliptical smudge on the sky.
+///
+/// What: where a galaxy sits and how big, stretched and bright to draw it.
+/// How/why: we scatter `points` faint stars in a Gaussian ellipse `major_deg` across
+/// (squashed by `axis_ratio`, turned by `pa_deg`) at the galaxy's real (RA, Dec), so
+/// it reads as a soft elongated patch. The positions are angular, so the smudge
+/// scales correctly when you zoom.
+/// Units: `ra_deg`/`dec_deg`/`major_deg`/`pa_deg` in degrees; `axis_ratio` and
+/// `color` dimensionless; `bright` a linear-RGB level; `points` a count.
+struct Neighbor {
+    /// Kept for readability of the table; not used at runtime.
+    #[allow(dead_code)]
+    name: &'static str,
+    ra_deg: f64,
+    dec_deg: f64,
+    major_deg: f64,
+    axis_ratio: f64,
+    pa_deg: f64,
+    bright: f64,
+    color: [f64; 3],
+    points: usize,
+}
+
+/// The nearest, naked-eye galaxies (positions/sizes from catalogues, J2000).
+///
+/// What: Andromeda, Triangulum and the two Magellanic Clouds.
+/// How/why: these are the galaxies actually visible to the eye; each is tinted
+/// roughly by its stars (old-and-warm for the spirals' bulges, blue for the
+/// star-forming Clouds) and sized to its real angular extent.
+/// Units: see [`Neighbor`].
+const NEIGHBORS: &[Neighbor] = &[
+    Neighbor {
+        name: "Andromeda (M31)",
+        ra_deg: 10.68,
+        dec_deg: 41.27,
+        major_deg: 3.0,
+        axis_ratio: 0.32,
+        pa_deg: 35.0,
+        bright: 0.16,
+        color: [1.0, 0.95, 0.85],
+        points: 280,
+    },
+    Neighbor {
+        name: "Triangulum (M33)",
+        ra_deg: 23.46,
+        dec_deg: 30.66,
+        major_deg: 1.2,
+        axis_ratio: 0.6,
+        pa_deg: 23.0,
+        bright: 0.10,
+        color: [0.92, 0.96, 1.0],
+        points: 120,
+    },
+    Neighbor {
+        name: "Large Magellanic Cloud",
+        ra_deg: 80.89,
+        dec_deg: -69.76,
+        major_deg: 9.0,
+        axis_ratio: 0.85,
+        pa_deg: 170.0,
+        bright: 0.14,
+        color: [0.85, 0.92, 1.0],
+        points: 320,
+    },
+    Neighbor {
+        name: "Small Magellanic Cloud",
+        ra_deg: 13.16,
+        dec_deg: -72.8,
+        major_deg: 5.0,
+        axis_ratio: 0.5,
+        pa_deg: 45.0,
+        bright: 0.12,
+        color: [0.85, 0.92, 1.0],
+        points: 200,
+    },
+];
+
+/// Build the faint star clouds for the neighbour galaxies.
+///
+/// What: returns [`StarInstance`]s for every galaxy in [`NEIGHBORS`].
+/// How/why: for each galaxy we take its sky direction, build two tangent vectors
+/// there, and scatter Gaussian-distributed points in an ellipse (σ = half the major
+/// axis, squashed by the axis ratio, rotated by the position angle). Points near the
+/// centre are also brightened, so the dense, bright core fades to a soft halo. A
+/// fixed seed makes every galaxy identical each run.
+/// Principle: an unresolved galaxy is the blended light of billions of stars; a
+/// Gaussian cloud of faint additive points mimics that soft elliptical glow.
+/// Units: directions are unit vectors; sizes in pixels; colours linear RGB.
+pub fn neighbor_galaxies() -> Vec<StarInstance> {
+    let mut rng = Rng::new(0x1CE_A11_DEAD_BEEF);
+    let mut out = Vec::new();
+    for g in NEIGHBORS {
+        let d0 = radec_to_ecliptic(g.ra_deg, g.dec_deg);
+        // Two unit tangents on the sky at the galaxy's centre.
+        let helper = if d0.z.abs() < 0.95 { DVec3::Z } else { DVec3::X };
+        let e1 = (helper - d0 * helper.dot(d0)).normalize();
+        let e2 = d0.cross(e1);
+
+        let sigma_major = (g.major_deg * 0.5).to_radians();
+        let sigma_minor = sigma_major * g.axis_ratio;
+        let (sp, cp) = g.pa_deg.to_radians().sin_cos();
+
+        for _ in 0..g.points {
+            let u = rng.gaussian(); // along the major axis (in σ units)
+            let v = rng.gaussian(); // along the minor axis
+            // Place the point, rotating the ellipse by the position angle.
+            let a1 = sigma_major * (u * cp) - sigma_minor * (v * sp);
+            let a2 = sigma_major * (u * sp) + sigma_minor * (v * cp);
+            let dir = (d0 + e1 * a1 + e2 * a2).normalize();
+
+            // Brighten the core (small u,v), fade the halo.
+            let falloff = (-0.5 * (u * u + v * v)).exp();
+            let bright = g.bright * (0.5 + 0.7 * rng.unit()) * (0.4 + 0.6 * falloff);
+            let color = [
+                (bright * g.color[0]) as f32,
+                (bright * g.color[1]) as f32,
+                (bright * g.color[2]) as f32,
+            ];
+            let size =
+                (NEIGHBOR_SIZE_MIN + (NEIGHBOR_SIZE_MAX - NEIGHBOR_SIZE_MIN) * rng.unit()) as f32;
+            out.push(StarInstance {
+                dir: [dir.x as f32, dir.y as f32, dir.z as f32],
+                size,
+                color,
+                _pad: 0.0,
+            });
+        }
+    }
+    out
+}
+
 /// A smooth 0→1 ramp between two edges (the GLSL `smoothstep`).
 ///
 /// What: 0 below `e0`, 1 above `e1`, an S-curve in between.
@@ -266,5 +406,30 @@ mod tests {
         }
         let mean_deg = (sum_abs_b / band.len() as f64).to_degrees();
         assert!(mean_deg < 12.0, "band too thick: mean |b| = {mean_deg}°");
+    }
+
+    /// Each neighbour galaxy makes the right number of unit-length points, clustered
+    /// around its catalogue position.
+    #[test]
+    fn neighbor_galaxies_are_placed_and_clustered() {
+        let total: usize = NEIGHBORS.iter().map(|g| g.points).sum();
+        let stars = neighbor_galaxies();
+        assert_eq!(stars.len(), total);
+        for s in &stars {
+            let len =
+                (s.dir[0] * s.dir[0] + s.dir[1] * s.dir[1] + s.dir[2] * s.dir[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-4, "len = {len}");
+        }
+
+        // The first block of points belongs to Andromeda; they must sit near it.
+        let m31 = &NEIGHBORS[0];
+        let center = radec_to_ecliptic(m31.ra_deg, m31.dec_deg);
+        let mut max_sep = 0.0_f64;
+        for s in &stars[..m31.points] {
+            let d = DVec3::new(s.dir[0] as f64, s.dir[1] as f64, s.dir[2] as f64);
+            let sep = d.dot(center).clamp(-1.0, 1.0).acos().to_degrees();
+            max_sep = max_sep.max(sep);
+        }
+        assert!(max_sep < 15.0, "M31 points stray {max_sep}° from its centre");
     }
 }
