@@ -8,6 +8,9 @@
 //! their overlapping glows add up (the starfield uses additive blending) into the
 //! soft band you see edge-on from inside our own galaxy's disk.
 
+use glam::DVec3;
+
+use crate::noise::fbm;
 use crate::render::starfield::StarInstance;
 use crate::stars::project::galactic_to_ecliptic;
 
@@ -36,9 +39,54 @@ const BAND_LATITUDE_SIGMA_DEG: f64 = 6.0;
 /// diffuse glow, not as competing points; the bulge near the Galactic Centre is a
 /// touch brighter than the outer arms. With additive blending many of these sum up
 /// in the dense band.
+/// `BAND_MIN_BRIGHT` is the baseline along the whole band; `BAND_MAX_BRIGHT` is the
+/// brightness at the heart of the bulge.
 /// Units: linear-RGB brightness (dimensionless).
-const BAND_MIN_BRIGHT: f64 = 0.10;
-const BAND_MAX_BRIGHT: f64 = 0.22;
+const BAND_MIN_BRIGHT: f64 = 0.12;
+const BAND_MAX_BRIGHT: f64 = 0.30;
+
+/// How tightly the bright, warm bulge is concentrated on the Galactic Centre.
+///
+/// What: the power applied to the bulge falloff.
+/// How/why: the bulge weight is `(cos b·cos l)` (1 at the centre, dropping away);
+/// raising it to this power shrinks the glow into a localized swelling around
+/// Sagittarius instead of a band-long brightening. Higher = tighter.
+/// Units: dimensionless exponent.
+const BULGE_TIGHTNESS: f64 = 2.5;
+
+/// Feature scale of the dust lanes (how finely the dark rifts are cut).
+///
+/// What: the noise frequency for the dust field.
+/// How/why: the galactic direction is multiplied by this before the dust noise;
+/// higher gives more, finer lanes.
+/// Units: dimensionless.
+const DUST_FREQUENCY: f64 = 5.0;
+
+/// A fixed offset so the dust noise does not line up with anything else.
+const DUST_OFFSET: DVec3 = DVec3::new(20.5, 13.1, 7.7);
+
+/// Soft thresholds turning the dust noise into a clear↔dusty mix.
+///
+/// What: below `DUST_LO` the sky is fully dusty (dark), above `DUST_HI` it is clear.
+/// How/why: sliding these sets how much of the band is eaten by dark lanes.
+/// Units: dimensionless (noise value).
+const DUST_LO: f64 = 0.42;
+const DUST_HI: f64 = 0.52;
+
+/// How far from the galactic plane the dust reaches, in degrees (Gaussian σ).
+///
+/// What: the dust only darkens stars near the plane (`b ≈ 0`), where it really lies.
+/// How/why: real dust forms a thin layer in the disk, so the dark lanes split the
+/// *core* of the band (the "Great Rift") and leave its edges alone.
+/// Units: degrees.
+const DUST_PLANE_SIGMA: f64 = 4.0;
+
+/// Strongest fraction of a star's light the dust can absorb.
+///
+/// What: how dark the deepest lanes get (1.0 would be fully black).
+/// How/why: just short of black so the lanes read as dark dust, not holes.
+/// Units: dimensionless fraction.
+const DUST_STRENGTH: f64 = 0.85;
 
 /// Smallest and largest drawn dot size for a band star.
 ///
@@ -68,18 +116,33 @@ pub fn milky_way_band() -> Vec<StarInstance> {
         let l = rng.unit() * 360.0;
         // Gaussian latitude: the band is thin near the plane, thinning out above it.
         let b = BAND_LATITUDE_SIGMA_DEG * rng.gaussian();
+        let (sl, cl) = l.to_radians().sin_cos();
+        let (sb, cb) = b.to_radians().sin_cos();
+        // Direction in the galactic frame (x → Galactic Centre, z → North Pole).
+        let gal = DVec3::new(cb * cl, cb * sl, sb);
 
-        // Brighter toward the Galactic Centre (l ≈ 0): `center` runs 1 → 0.
-        let center = 0.5 + 0.5 * l.to_radians().cos();
-        let base = BAND_MIN_BRIGHT + (BAND_MAX_BRIGHT - BAND_MIN_BRIGHT) * center;
-        let bright = base * (0.6 + 0.8 * rng.unit()); // per-star brightness jitter
+        // Bulge: a bright, warm swelling around the Galactic Centre. `gal.x` is 1 at
+        // the centre and falls off in every direction; the power tightens it.
+        let bulge = gal.x.max(0.0).powf(BULGE_TIGHTNESS);
 
-        // Slightly warm (yellow) toward the bulge, slightly cool (blue) in the arms.
-        let warm = center;
+        // Dust lanes: dark rifts where interstellar dust absorbs the starlight. Read
+        // a noise field in galactic space and darken its dim patches — but only near
+        // the plane (b ≈ 0), where the dust lies — so dark lanes split the band's
+        // core (the Milky Way's "Great Rift").
+        let clear = smoothstep(DUST_LO, DUST_HI, fbm(gal * DUST_FREQUENCY + DUST_OFFSET, 4));
+        let in_plane = (-(b * b) / (2.0 * DUST_PLANE_SIGMA * DUST_PLANE_SIGMA)).exp();
+        let absorption = DUST_STRENGTH * in_plane * (1.0 - clear);
+
+        // Brighter toward the bulge, then dimmed by any dust in front.
+        let base = BAND_MIN_BRIGHT + (BAND_MAX_BRIGHT - BAND_MIN_BRIGHT) * bulge;
+        let bright = base * (0.6 + 0.8 * rng.unit()) * (1.0 - absorption);
+
+        // Cool-neutral in the arms, warm gold toward the bulge.
+        let warm = bulge;
         let color = [
-            (bright * (0.85 + 0.20 * warm)) as f32,
-            (bright * 0.88) as f32,
-            (bright * (0.95 - 0.10 * warm)) as f32,
+            (bright * (0.82 + 0.42 * warm)) as f32,
+            (bright * (0.85 + 0.10 * warm)) as f32,
+            (bright * (0.95 - 0.38 * warm)) as f32,
         ];
         let size = (BAND_SIZE_MIN + (BAND_SIZE_MAX - BAND_SIZE_MIN) * rng.unit()) as f32;
 
@@ -92,6 +155,17 @@ pub fn milky_way_band() -> Vec<StarInstance> {
         });
     }
     out
+}
+
+/// A smooth 0→1 ramp between two edges (the GLSL `smoothstep`).
+///
+/// What: 0 below `e0`, 1 above `e1`, an S-curve in between.
+/// How/why: clamp `(x−e0)/(e1−e0)` to 0..1, then shape it with `3t²−2t³` for a
+/// soft transition — here, between clear sky and full dust.
+/// Units: dimensionless.
+fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// A tiny deterministic random-number generator (SplitMix64).

@@ -25,6 +25,7 @@ mod astro;
 mod bodies;
 mod config;
 mod edu;
+mod noise;
 mod physics;
 mod render;
 mod stars;
