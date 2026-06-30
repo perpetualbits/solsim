@@ -132,6 +132,17 @@ const CLOUD_ALTITUDE: f32 = 1.02;
 /// Units: dimensionless ratio.
 const CLOUD_DRIFT: f64 = 1.03;
 
+/// Closest the free camera may sit to the focused body, as a multiple of its
+/// drawn radius.
+///
+/// What: the zoom-in stop, just above the surface.
+/// How/why: a hair above the surface so you cannot fly through the body (and, with
+/// the floating origin, fall toward its centre forever). It cannot be much smaller
+/// because the near clip plane scales with the zoom — getting *much* closer than
+/// this would clip the surface away anyway.
+/// Units: dimensionless ratio.
+const SURFACE_CLEARANCE: f64 = 1.005;
+
 /// Decode the body texture maps into the layers of the GPU texture array.
 ///
 /// What: builds one RGBA layer per body map, with a white layer 0 for untextured
@@ -909,6 +920,29 @@ impl App {
 
         // The free camera is centred on the chosen focus body.
         self.camera.target = focus;
+
+        // Stop the zoom just above the focused body's surface, so you cannot fly
+        // through it and fall toward its centre forever. The "surface" is whatever
+        // size the body is drawn at right now (exaggerated, true-scale, or log).
+        let focus_i = self.focus_index.min(BODIES.len() - 1);
+        let focus_surface = if self.log {
+            (BODIES[focus_i].draw_radius_au * LOG_SIZE_BOOST).clamp(LOG_MIN_SIZE, LOG_MAX_SIZE)
+                as f64
+        } else if self.true_scale {
+            bodies::real_radius_au(BODIES[focus_i].name)
+        } else {
+            BODIES[focus_i].draw_radius_au as f64
+        };
+        self.camera.min_radius = focus_surface * SURFACE_CLEARANCE;
+        self.camera.radius = self.camera.radius.max(self.camera.min_radius);
+        // The top-down view orbits the Sun; keep it from diving into the Sun too.
+        let sun_surface = if self.true_scale {
+            bodies::real_radius_au("Sun")
+        } else {
+            BODIES[0].draw_radius_au as f64
+        };
+        self.top_camera.min_radius = sun_surface * SURFACE_CLEARANCE;
+        self.top_camera.radius = self.top_camera.radius.max(self.top_camera.min_radius);
 
         // The floating-origin centre depends on the viewpoint: the top-down view
         // is centred on the Sun, the surface view on the Earth (the observer), and

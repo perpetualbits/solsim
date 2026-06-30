@@ -30,6 +30,9 @@ pub struct OrbitCamera {
     pub phi: f64,
     /// Distance from the target, in AU.
     pub radius: f64,
+    /// Closest the camera may get to the target, in AU. The app sets this each
+    /// frame to just above the focused body's surface so you cannot zoom through it.
+    pub min_radius: f64,
     /// The point the camera looks at, in AU (the floating-origin centre).
     pub target: DVec3,
     /// Vertical field of view, in radians.
@@ -51,6 +54,7 @@ impl Default for OrbitCamera {
             theta: 0.6,
             phi: 0.5,
             radius: 0.025,
+            min_radius: 1.0e-5,
             target: DVec3::ZERO,
             fovy: std::f64::consts::FRAC_PI_4, // 45°
         }
@@ -78,7 +82,7 @@ impl OrbitCamera {
     /// target or impossibly far away.
     /// Units: `factor` is dimensionless (e.g. 0.9 zooms in, 1.1 zooms out).
     pub fn zoom(&mut self, factor: f64) {
-        self.radius = (self.radius * factor).clamp(1.0e-5, 100.0);
+        self.radius = (self.radius * factor).clamp(self.min_radius, 100.0);
     }
 
     /// Near and far clip distances for the current zoom.
