@@ -25,6 +25,7 @@ mod astro;
 mod bodies;
 mod config;
 mod edu;
+mod galaxy_mode;
 mod noise;
 mod physics;
 mod rng;
@@ -561,6 +562,7 @@ fn build_overlay(ui: &mut egui::Ui, info: &HudInfo, focus: &mut usize) {
                 ui.label("K — educational mode (vector walkthrough)");
                 ui.label("Y — energy graph (kinetic / potential / total)");
                 ui.label("J — Kepler equal-area sweep (focus a planet; top-down view)");
+                ui.label("X — colliding-galaxies mode (Barnes–Hut N-body)");
                 ui.label("E / N / G — engine: Ephemeris / Newtonian / GR");
                 ui.label("[  /  ]  — GR strength ÷10 / ×10");
                 ui.label("F1 / H — open the manual");
@@ -645,6 +647,8 @@ struct App {
     energy_hist: std::collections::VecDeque<ui::energy::Sample>,
     /// Whether the Kepler's-second-law equal-area sweep is shown for the focus.
     show_kepler: bool,
+    /// The colliding-galaxies mode, when active (replaces the solar-system scene).
+    galaxy: Option<galaxy_mode::GalaxyMode>,
     /// True when the integrated engine could not keep up this frame and time was
     /// held back to protect orbit accuracy (shown as a HUD warning).
     physics_speed_limited: bool,
@@ -717,6 +721,7 @@ impl App {
             show_energy: false,
             energy_hist: std::collections::VecDeque::new(),
             show_kepler: false,
+            galaxy: None,
             physics_speed_limited: false,
             edu: None,
             screenshot_requested: false,
@@ -792,6 +797,12 @@ impl App {
             } else {
                 self.fps * 0.9 + instant_fps * 0.1
             };
+        }
+
+        // The colliding-galaxies mode replaces the whole solar-system scene.
+        if self.galaxy.is_some() {
+            self.draw_galaxy();
+            return;
         }
 
         // Pull the screenshot request out now, before the GPU fields are borrowed.
@@ -1353,6 +1364,7 @@ impl App {
             &line_segs,
             &ring_verts,
             &area_verts,
+            &[],
             &arrows,
         );
 
@@ -1422,6 +1434,151 @@ impl App {
         self.focus_index = new_focus.min(BODIES.len() - 1);
         if !BODIES[self.focus_index].core {
             self.show_all = true;
+        }
+    }
+
+    /// Draw one frame of the colliding-galaxies mode.
+    ///
+    /// What: steps the galaxy simulation and renders it as a point cloud, in place
+    /// of the solar-system scene.
+    /// How/why: advance the sim and colour the particles, then reuse the shared
+    /// scene renderer with only the point cloud filled in (all solar geometry
+    /// empty, stars off); a small egui panel shows the controls.
+    /// Units: none.
+    fn draw_galaxy(&mut self) {
+        // Advance the sim and build the point cloud (galaxy owned locally meanwhile).
+        let Some(mut gm) = self.galaxy.take() else {
+            return;
+        };
+        gm.step();
+        let center = gm.center();
+        let points = gm.points(center);
+        let sim_time = gm.time();
+        let n = gm.len();
+        self.galaxy = Some(gm);
+
+        let fps = self.fps;
+        let (Some(window), Some(gpu), Some(egui), Some(scene)) = (
+            self.window.as_ref(),
+            self.gpu.as_mut(),
+            self.egui.as_mut(),
+            self.scene.as_ref(),
+        ) else {
+            return;
+        };
+
+        let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
+        let view_proj = self.camera.view_proj(aspect);
+
+        let raw_input = egui.state.take_egui_input(window);
+        let full_output = egui.ctx.run_ui(raw_input, |ctx_ui| {
+            egui::Window::new("Colliding galaxies")
+                .resizable(false)
+                .show(ctx_ui.ctx(), |ui| {
+                    ui.label(format!("Particles: {n}"));
+                    ui.label(format!("Sim time: {sim_time:.1}"));
+                    ui.label(format!("FPS: {fps:.0}"));
+                    ui.separator();
+                    ui.label("Drag — orbit    Wheel — zoom");
+                    ui.label("X — back to the solar system");
+                });
+        });
+        egui.state
+            .handle_platform_output(window, full_output.platform_output);
+        let paint_jobs = egui
+            .ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [gpu.config.width, gpu.config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        let frame = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                let (w, h) = (gpu.config.width, gpu.config.height);
+                gpu.resize(w, h);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                eprintln!("surface validation error while acquiring frame");
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("galaxy frame encoder"),
+            });
+        for (id, delta) in &full_output.textures_delta.set {
+            egui.renderer
+                .update_texture(&gpu.device, &gpu.queue, *id, delta);
+        }
+        let egui_cmds = egui.renderer.update_buffers(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen,
+        );
+
+        // Only the point cloud is drawn; everything solar is empty and stars are off.
+        scene.render(
+            &gpu.queue,
+            &mut encoder,
+            &view,
+            &gpu.depth_view,
+            view_proj,
+            glam::Vec3::ZERO,
+            [gpu.config.width as f32, gpu.config.height as f32],
+            [0.0, 0.0],
+            view_proj,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &points,
+            &[],
+        );
+
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("galaxy egui pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut render_pass = render_pass.forget_lifetime();
+            egui.renderer.render(&mut render_pass, &paint_jobs, &screen);
+        }
+
+        gpu.queue.submit(
+            egui_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        frame.present();
+        for id in &full_output.textures_delta.free {
+            egui.renderer.free_texture(id);
         }
     }
 }
@@ -1606,6 +1763,22 @@ impl ApplicationHandler for App {
                         }
                         "y" => self.show_energy = !self.show_energy,
                         "j" => self.show_kepler = !self.show_kepler,
+                        "x" => {
+                            if self.galaxy.is_some() {
+                                // Back to the solar system.
+                                self.galaxy = None;
+                                self.camera = OrbitCamera::default();
+                            } else {
+                                // Enter the colliding-galaxies mode; frame the pair.
+                                self.galaxy = Some(galaxy_mode::GalaxyMode::new());
+                                self.viewpoint = Viewpoint::Free;
+                                self.camera.target = DVec3::ZERO;
+                                self.camera.min_radius = 1.0e-3;
+                                self.camera.radius = 18.0;
+                                self.camera.theta = 0.7;
+                                self.camera.phi = 0.45;
+                            }
+                        }
                         "q" => event_loop.exit(),
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,

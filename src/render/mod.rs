@@ -12,6 +12,7 @@ pub mod camera;
 pub mod clouds;
 pub mod grid;
 pub mod logscale;
+pub mod points;
 pub mod rings;
 pub mod screenshot;
 pub mod sphere;
@@ -26,6 +27,7 @@ use glam::{Mat4, Vec3};
 use areas::{AreaPass, AreaVertex};
 use arrows::{ArrowInstance, ArrowPass};
 use grid::{LinePass, LineSeg};
+use points::{PointInstance, PointPass};
 use rings::{RingPass, RingVertex};
 use sphere::{BodyPass, Instance};
 use starfield::{StarInstance, StarfieldPass};
@@ -37,6 +39,9 @@ const LINE_CAPACITY: u32 = 16384;
 
 /// Maximum number of area-shading vertices per frame (the Kepler sweep sectors).
 const AREA_CAPACITY: u32 = 8192;
+
+/// Maximum number of galaxy-mode particles drawn per frame.
+const POINT_CAPACITY: u32 = 300_000;
 
 /// Camera/scene data shared by every shader, as one uniform block.
 ///
@@ -72,6 +77,7 @@ pub struct Scene {
     ring_pass: RingPass,
     arrow_pass: ArrowPass,
     area_pass: AreaPass,
+    point_pass: PointPass,
 }
 
 impl Scene {
@@ -157,6 +163,13 @@ impl Scene {
             depth_format,
             AREA_CAPACITY,
         );
+        let point_pass = PointPass::new(
+            device,
+            &globals_layout,
+            color_format,
+            depth_format,
+            POINT_CAPACITY,
+        );
 
         Self {
             globals_buf,
@@ -168,6 +181,7 @@ impl Scene {
             ring_pass,
             arrow_pass,
             area_pass,
+            point_pass,
         }
     }
 
@@ -200,6 +214,7 @@ impl Scene {
         line_segs: &[LineSeg],
         ring_verts: &[RingVertex],
         area_verts: &[AreaVertex],
+        point_instances: &[PointInstance],
         arrow_instances: &[ArrowInstance],
     ) {
         let globals = Globals {
@@ -216,6 +231,7 @@ impl Scene {
         self.line_pass.upload(queue, line_segs);
         self.ring_pass.upload(queue, ring_verts);
         self.area_pass.upload(queue, area_verts);
+        self.point_pass.upload(queue, point_instances);
         self.arrow_pass.upload(queue, arrow_instances);
         if show_stars {
             self.star_pass.update(queue, star_view_proj, viewport);
@@ -272,6 +288,9 @@ impl Scene {
         // Kepler equal-area sectors (translucent diagram overlay).
         self.area_pass
             .record(&mut pass, &self.globals_bind_group, area_verts.len() as u32);
+        // Galaxy-mode particle cloud (additive points).
+        self.point_pass
+            .record(&mut pass, &self.globals_bind_group, point_instances.len() as u32);
         // Vector arrows (educational mode) draw last, always on top.
         self.arrow_pass.record(
             &mut pass,

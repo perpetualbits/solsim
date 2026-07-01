@@ -79,6 +79,16 @@ exaggerate the effect (gr-strength); the orbit's trail then draws a 'rosette' yo
 can watch form, while the Newtonian engine keeps a closed ellipse.",
     ),
     (
+        "Colliding galaxies (press X)",
+        "Press X to leave the solar system and enter a colliding-galaxies mode: two \
+model galaxies — each a heavy centre wrapped in a disk of tens of thousands of \
+star particles — fall past each other under gravity. Watch the tides draw out long \
+bridges and tails, just as in real galaxy collisions like the Antennae. This uses a \
+'Barnes–Hut octree', a trick that groups far-away stars into a single lump so the \
+force on each of the ~60000 particles can be found quickly (it would otherwise take \
+N² sums). Drag to orbit and scroll to zoom; press X again to come back.",
+    ),
+    (
         "Kepler's second law: equal areas",
         "Press J (with a planet in focus, best in the top-down view) to see Kepler's \
 second law. The line from the Sun to the planet sweeps out the shaded wedges; one \

@@ -242,4 +242,30 @@ mod tests {
         assert!((pos[0] - DVec3::new(-4.0, 0.75, 0.0)).length() < 1e-9);
         assert!((pos[101] - DVec3::new(4.0, -0.75, 0.0)).length() < 1e-9);
     }
+
+    /// A colliding pair, stepped through the Barnes–Hut leapfrog, must stay finite
+    /// (the full galaxy-mode dynamics path, minus the graphics).
+    #[test]
+    fn colliding_pair_stays_finite() {
+        let mk = |spin: f64| GalaxyParams {
+            n_disk: 200,
+            central_mass: 4.0,
+            disk_mass: 1.0,
+            scale_radius: 1.0,
+            thickness: 0.05,
+            spin,
+        };
+        let (pos, vel, mass) =
+            colliding_pair(&mk(1.0), &mk(1.0), 1.0, 12.0, 0.5, 2.5, 1.0, 1);
+        let mut sys = Particles::new(pos, vel, mass, 0.6, 0.05, 1.0);
+        for _ in 0..120 {
+            sys.step(0.05);
+        }
+        for p in &sys.pos {
+            assert!(p.is_finite(), "a particle went non-finite during the collision");
+        }
+        // The two galaxies should have moved toward each other (they were falling in).
+        let sep = (sys.pos[0] - sys.pos[201]).length();
+        assert!(sep < 12.0, "galaxies did not approach (separation {sep})");
+    }
 }
