@@ -21,8 +21,8 @@ use crate::render::points::PointInstance;
 const N_DISK: usize = 30_000;
 /// Simulation time advanced per step (leapfrog is stable at this size).
 const DT: f64 = 0.05;
-/// Simulation steps advanced per rendered frame.
-const STEPS_PER_FRAME: u32 = 1;
+/// Most simulation steps we will run in a single frame (the fast-forward cap).
+const MAX_STEPS_PER_FRAME: u32 = 32;
 /// Barnes–Hut opening angle (bigger = faster, a little rougher).
 const THETA: f64 = 0.6;
 /// Gravitational softening (a length), so close particles do not blow up.
@@ -41,6 +41,7 @@ pub struct GalaxyMode {
     sim: Particles,
     n_a: usize,
     time: f64,
+    steps_per_frame: u32,
 }
 
 impl Default for GalaxyMode {
@@ -74,15 +75,31 @@ impl GalaxyMode {
             sim: Particles::new(pos, vel, mass, THETA, SOFTENING, G),
             n_a,
             time: 0.0,
+            steps_per_frame: 1,
         }
     }
 
     /// Advance the simulation by one frame's worth of steps.
     pub fn step(&mut self) {
-        for _ in 0..STEPS_PER_FRAME {
+        for _ in 0..self.steps_per_frame {
             self.sim.step(DT);
             self.time += DT;
         }
+    }
+
+    /// Steps run per frame (the fast-forward setting).
+    pub fn steps_per_frame(&self) -> u32 {
+        self.steps_per_frame
+    }
+
+    /// Fast-forward: run more steps per frame (doubling, up to the cap).
+    pub fn faster(&mut self) {
+        self.steps_per_frame = (self.steps_per_frame * 2).min(MAX_STEPS_PER_FRAME);
+    }
+
+    /// Slow down: run fewer steps per frame (halving, at least one).
+    pub fn slower(&mut self) {
+        self.steps_per_frame = (self.steps_per_frame / 2).max(1);
     }
 
     /// Number of particles.
@@ -115,11 +132,11 @@ impl GalaxyMode {
             let rel = (*p - center).as_vec3();
             let core = i == 0 || i == self.n_a;
             let (color, size) = if core {
-                ([1.0, 1.0, 0.85, 1.0], 7.0)
+                ([1.0, 1.0, 0.9, 1.0], 8.0)
             } else if i < self.n_a {
-                ([0.45, 0.65, 1.0, 0.4], 1.6)
+                ([0.55, 0.72, 1.0, 0.62], 1.8)
             } else {
-                ([1.0, 0.65, 0.35, 0.4], 1.6)
+                ([1.0, 0.7, 0.42, 0.62], 1.8)
             };
             out.push(PointInstance {
                 pos: [rel.x, rel.y, rel.z],

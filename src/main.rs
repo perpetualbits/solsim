@@ -1455,6 +1455,7 @@ impl App {
         let points = gm.points(center);
         let sim_time = gm.time();
         let n = gm.len();
+        let steps = gm.steps_per_frame();
         self.galaxy = Some(gm);
 
         let fps = self.fps;
@@ -1470,6 +1471,17 @@ impl App {
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         let view_proj = self.camera.view_proj(aspect);
 
+        // A reference grid at galaxy scale (toggled with C, as in the solar view).
+        // Points are already centred on the galaxy pair, so the grid sits at the
+        // render origin.
+        let view_scale = self.camera.radius;
+        let grid_lines: Vec<LineSeg> = if self.show_grid {
+            grid::build_grid(DVec3::ZERO, view_scale, GRID_COLOR)
+        } else {
+            Vec::new()
+        };
+        let grid_fade = grid::fade_distances(view_scale);
+
         let raw_input = egui.state.take_egui_input(window);
         let full_output = egui.ctx.run_ui(raw_input, |ctx_ui| {
             egui::Window::new("Colliding galaxies")
@@ -1477,9 +1489,11 @@ impl App {
                 .show(ctx_ui.ctx(), |ui| {
                     ui.label(format!("Particles: {n}"));
                     ui.label(format!("Sim time: {sim_time:.1}"));
+                    ui.label(format!("Speed: {steps}× steps/frame"));
                     ui.label(format!("FPS: {fps:.0}"));
                     ui.separator();
                     ui.label("Drag — orbit    Wheel — zoom");
+                    ui.label(".  /  ,  — faster / slower    C — grid");
                     ui.label("X — back to the solar system");
                 });
         });
@@ -1536,14 +1550,14 @@ impl App {
             view_proj,
             glam::Vec3::ZERO,
             [gpu.config.width as f32, gpu.config.height as f32],
-            [0.0, 0.0],
+            grid_fade,
             view_proj,
             false,
             &[],
             &[],
             &[],
             &[],
-            &[],
+            &grid_lines,
             &[],
             &[],
             &points,
@@ -1782,9 +1796,22 @@ impl ApplicationHandler for App {
                         "q" => event_loop.exit(),
                         "h" => self.show_manual = !self.show_manual,
                         "?" | "/" => self.show_help = !self.show_help,
-                        // Time speed up / down by ×10, clamped to a sensible range.
-                        "." => self.change_speed(10.0),
-                        "," => self.change_speed(0.1),
+                        // Time speed up / down: galaxy steps-per-frame in galaxy
+                        // mode, otherwise the solar clock (×10 / ÷10).
+                        "." => {
+                            if let Some(gm) = self.galaxy.as_mut() {
+                                gm.faster();
+                            } else {
+                                self.change_speed(10.0);
+                            }
+                        }
+                        "," => {
+                            if let Some(gm) = self.galaxy.as_mut() {
+                                gm.slower();
+                            } else {
+                                self.change_speed(0.1);
+                            }
+                        }
                         _ => {}
                     },
                     Key::Named(NamedKey::Space) => self.paused = !self.paused,
