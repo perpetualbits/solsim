@@ -78,16 +78,94 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The resident point shader: positions come straight from the simulation's GPU
+/// buffer (no CPU copy), and the colour/size are derived from the particle index.
+///
+/// The framing centre — the midpoint of the two galaxy cores — is computed in the
+/// shader from `pos[0]` and `pos[n_a]`; every vertex reads the same two addresses, so
+/// they stay cached and it costs essentially nothing. That is what lets the whole
+/// draw skip the per-frame readback and CPU rebuild.
+const RESIDENT_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    sun_pos: vec3<f32>,
+    _pad: f32,
+    viewport: vec2<f32>,
+    grid_fade: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> g: Globals;
+
+struct Cloud { n_a: u32, _a: u32, _b: u32, _c: u32 };
+@group(1) @binding(0) var<uniform> c: Cloud;
+@group(1) @binding(1) var<storage, read> pos: array<vec4<f32>>;
+
+var<private> CORNERS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+);
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) corner: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    var out: VsOut;
+    let corner = CORNERS[vi];
+    out.corner = corner;
+
+    // Colour/size by which galaxy (and the bright cores at 0 and n_a).
+    var color = vec4<f32>(0.55, 0.72, 1.0, 0.62);   // galaxy A: cool blue
+    var size = 1.8;
+    if (ii == 0u || ii == c.n_a) {
+        color = vec4<f32>(1.0, 1.0, 0.9, 1.0);      // core
+        size = 8.0;
+    } else if (ii >= c.n_a) {
+        color = vec4<f32>(1.0, 0.7, 0.42, 0.62);    // galaxy B: warm
+    }
+    out.color = color;
+
+    // Keep the pair framed at the origin: subtract the midpoint of the two cores.
+    let center = (pos[0].xyz + pos[c.n_a].xyz) * 0.5;
+    let world = pos[ii].xyz - center;
+
+    let clip = g.view_proj * vec4<f32>(world, 1.0);
+    if (clip.w <= 0.0) {
+        out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
+    let ndc = clip.xy / clip.w;
+    let offset = corner * size / g.viewport;
+    out.clip = vec4<f32>(ndc + offset, 0.5, 1.0);
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    let r = length(in.corner);
+    let a = smoothstep(1.0, 0.0, r) * in.color.a;
+    return vec4<f32>(in.color.rgb * a, a);
+}
+"#;
+
 /// GPU resources for the point cloud.
 ///
-/// What: the pipeline and a per-frame instance buffer.
-/// How/why: built once; each frame we upload the current particles and draw them
-/// all in one instanced call.
+/// What: the CPU-instanced pipeline plus a resident pipeline that draws straight from
+/// the simulation's position buffer.
+/// How/why: the galaxy runs on the GPU, so its points are drawn from that buffer with
+/// no copy (`record_resident`); the CPU-instanced path (`upload`/`record`) remains for
+/// any caller that hands over explicit points.
 /// Units: not applicable (GPU handles).
 pub struct PointPass {
     pipeline: wgpu::RenderPipeline,
     instance_buf: wgpu::Buffer,
     capacity: u32,
+    resident_pipeline: wgpu::RenderPipeline,
+    resident_layout: wgpu::BindGroupLayout,
+    resident_params: wgpu::Buffer,
+    resident_bind: Option<wgpu::BindGroup>,
 }
 
 impl PointPass {
@@ -171,11 +249,148 @@ impl PointPass {
             cache: None,
         });
 
+        // Resident pipeline: same look, but reads positions from a storage buffer and
+        // colours by index. Group 0 is the shared globals; group 1 is the cloud data.
+        let resident_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resident points layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let resident_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident points params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let resident_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("resident point shader"),
+            source: wgpu::ShaderSource::Wgsl(RESIDENT_SHADER.into()),
+        });
+        let resident_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("resident point pipeline layout"),
+            bind_group_layouts: &[Some(globals_layout), Some(&resident_layout)],
+            immediate_size: 0,
+        });
+        let resident_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("resident point pipeline"),
+            layout: Some(&resident_pl),
+            vertex: wgpu::VertexState {
+                module: &resident_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &resident_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             instance_buf,
             capacity,
+            resident_pipeline,
+            resident_layout,
+            resident_params,
+            resident_bind: None,
         }
+    }
+
+    /// Point the resident draw at a simulation position buffer (call when it changes).
+    ///
+    /// What: builds the group-1 bind group from the given `pos` storage buffer and
+    /// records `n_a` (the galaxy-A/B split) for colouring.
+    /// How/why: the buffer is persistent, so this is done once when galaxy mode starts;
+    /// pass `None` to detach when leaving it.
+    pub fn bind_resident(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: Option<&wgpu::Buffer>,
+        n_a: u32,
+    ) {
+        self.resident_bind = pos.map(|pos| {
+            queue.write_buffer(&self.resident_params, 0, bytemuck::cast_slice(&[n_a, 0, 0, 0]));
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident points bind"),
+                layout: &self.resident_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.resident_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: pos.as_entire_binding() },
+                ],
+            })
+        });
+    }
+
+    /// Draw `count` particles straight from the bound position buffer (six verts each).
+    pub fn record_resident<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        globals: &'p wgpu::BindGroup,
+        count: u32,
+    ) {
+        let Some(bind) = self.resident_bind.as_ref() else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.resident_pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        pass.set_bind_group(1, bind, &[]);
+        pass.draw(0..6, 0..count);
     }
 
     /// Upload this frame's particles (at most what fits).

@@ -1376,6 +1376,7 @@ impl App {
             &area_verts,
             &[],
             &arrows,
+            0, // solar view: no resident galaxy cloud
         );
 
         // Pass 2: draw the egui overlay on top, keeping the rendered scene.
@@ -1465,8 +1466,6 @@ impl App {
         if let Some(gpu) = self.gpu.as_ref() {
             gm.step(&gpu.device, &gpu.queue);
         }
-        let center = gm.center();
-        let points = gm.points(center);
         let sim_time = gm.time();
         let n = gm.len();
         let steps = gm.steps_per_frame();
@@ -1577,8 +1576,9 @@ impl App {
             &grid_lines,
             &[],
             &[],
-            &points,
             &[],
+            &[],
+            n as u32, // draw the particle cloud straight from the sim's GPU buffer
         );
 
         {
@@ -1814,13 +1814,27 @@ impl ApplicationHandler for App {
                         "j" => self.show_kepler = !self.show_kepler,
                         "x" => {
                             if self.galaxy.is_some() {
-                                // Back to the solar system.
+                                // Back to the solar system; detach the cloud source.
                                 self.galaxy = None;
+                                if let (Some(gpu), Some(scene)) =
+                                    (self.gpu.as_ref(), self.scene.as_mut())
+                                {
+                                    scene.bind_galaxy_source(&gpu.device, &gpu.queue, None, 0);
+                                }
                                 self.camera = OrbitCamera::default();
-                            } else if let Some(gpu) = self.gpu.as_ref() {
-                                // Enter the colliding-galaxies mode; frame the pair.
-                                self.galaxy =
-                                    Some(galaxy_mode::GalaxyMode::new(&gpu.device, &gpu.queue));
+                            } else if let (Some(gpu), Some(scene)) =
+                                (self.gpu.as_ref(), self.scene.as_mut())
+                            {
+                                // Enter the colliding-galaxies mode; frame the pair and
+                                // point the renderer at the sim's GPU position buffer.
+                                let gm = galaxy_mode::GalaxyMode::new(&gpu.device, &gpu.queue);
+                                scene.bind_galaxy_source(
+                                    &gpu.device,
+                                    &gpu.queue,
+                                    Some(gm.pos_buffer()),
+                                    gm.n_a(),
+                                );
+                                self.galaxy = Some(gm);
                                 self.viewpoint = Viewpoint::Free;
                                 self.camera.target = DVec3::ZERO;
                                 self.camera.min_radius = 1.0e-3;

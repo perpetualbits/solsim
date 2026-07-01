@@ -2149,6 +2149,16 @@ impl GpuNBody {
         flat.chunks_exact(4).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
     }
 
+    /// The resident position buffer, for the renderer to draw from directly.
+    ///
+    /// What: the GPU buffer holding every particle's position (`vec4`, xyz used).
+    /// How/why: it is `STORAGE`, so a vertex shader can read it by instance index —
+    /// no copy to the CPU. Positions update in place each [`step`](Self::step).
+    /// Units: the caller's length.
+    pub fn pos_buffer(&self) -> &wgpu::Buffer {
+        &self.pos
+    }
+
     /// Number of particles.
     pub fn len(&self) -> usize {
         self.n

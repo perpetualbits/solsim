@@ -185,6 +185,21 @@ impl Scene {
         }
     }
 
+    /// Point the galaxy point cloud at a simulation position buffer (or detach it).
+    ///
+    /// What: forwards to the point pass so the resident draw reads straight from the
+    /// GPU-resident particle positions; `None` detaches when leaving galaxy mode.
+    /// How/why: the buffer is persistent, so this is called once when the mode starts.
+    pub fn bind_galaxy_source(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: Option<&wgpu::Buffer>,
+        n_a: u32,
+    ) {
+        self.point_pass.bind_resident(device, queue, pos, n_a);
+    }
+
     /// Draw the whole scene for one frame.
     ///
     /// What: clears the screen and draws the trails and bodies.
@@ -216,6 +231,7 @@ impl Scene {
         area_verts: &[AreaVertex],
         point_instances: &[PointInstance],
         arrow_instances: &[ArrowInstance],
+        galaxy_count: u32,
     ) {
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
@@ -288,9 +304,15 @@ impl Scene {
         // Kepler equal-area sectors (translucent diagram overlay).
         self.area_pass
             .record(&mut pass, &self.globals_bind_group, area_verts.len() as u32);
-        // Galaxy-mode particle cloud (additive points).
-        self.point_pass
-            .record(&mut pass, &self.globals_bind_group, point_instances.len() as u32);
+        // Galaxy-mode particle cloud (additive points). Prefer the resident draw
+        // (straight from the sim's GPU buffer); fall back to CPU-supplied points.
+        if galaxy_count > 0 {
+            self.point_pass
+                .record_resident(&mut pass, &self.globals_bind_group, galaxy_count);
+        } else {
+            self.point_pass
+                .record(&mut pass, &self.globals_bind_group, point_instances.len() as u32);
+        }
         // Vector arrows (educational mode) draw last, always on top.
         self.arrow_pass.record(
             &mut pass,

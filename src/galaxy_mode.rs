@@ -10,11 +10,8 @@
 //! Everything runs in scale-free units (`G = 1`, disk scale length 1); the camera
 //! just orbits the point cloud, so the absolute scale never matters.
 
-use glam::Vec3;
-
 use crate::physics::galaxy_ic::{colliding_pair, GalaxyParams};
 use crate::physics::gpu::GpuNBody;
-use crate::render::points::PointInstance;
 
 /// Disk particles per galaxy. Raise toward 50 000 for the 100k-body target (it
 /// runs slower per step); 30 000 keeps the collision smooth to watch.
@@ -42,7 +39,6 @@ const G: f32 = 1.0;
 /// Units: scale-free (`G = 1`).
 pub struct GalaxyMode {
     sim: GpuNBody,
-    positions: Vec<Vec3>,
     n_a: usize,
     time: f64,
     steps_per_frame: u32,
@@ -75,12 +71,21 @@ impl GalaxyMode {
         let sim = GpuNBody::new(device, queue, &pos, &vel, &mass, THETA, SOFTENING, G);
         GalaxyMode {
             sim,
-            positions: pos,
             n_a,
             time: 0.0,
             steps_per_frame: 1,
             theta: THETA,
         }
+    }
+
+    /// The GPU position buffer the renderer draws the cloud from (no CPU copy).
+    pub fn pos_buffer(&self) -> &wgpu::Buffer {
+        self.sim.pos_buffer()
+    }
+
+    /// Index of galaxy B's first particle (galaxy A is `0..n_a`), for colouring.
+    pub fn n_a(&self) -> u32 {
+        self.n_a as u32
     }
 
     /// Current Barnes–Hut opening angle θ (for the on-screen readout).
@@ -100,19 +105,17 @@ impl GalaxyMode {
         self.sim.set_theta(queue, self.theta);
     }
 
-    /// Advance the simulation by one frame's worth of steps, then mirror positions.
+    /// Advance the simulation by one frame's worth of steps, entirely on the GPU.
     ///
-    /// What: runs `steps_per_frame` GPU leapfrog steps and copies the new positions
-    /// back to the CPU for drawing.
-    /// How/why: each step is a single GPU submission; we read the position buffer back
-    /// just once, after the last step, so fast-forward costs no extra copies.
+    /// What: runs `steps_per_frame` GPU leapfrog steps.
+    /// How/why: each step is a single GPU submission; positions stay resident and are
+    /// drawn straight from the GPU buffer, so nothing is copied back to the CPU.
     /// Units: none.
     pub fn step(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         for _ in 0..self.steps_per_frame {
             self.sim.step(device, queue, DT);
             self.time += DT as f64;
         }
-        self.positions = self.sim.positions(device, queue);
     }
 
     /// Steps run per frame (the fast-forward setting).
@@ -140,38 +143,4 @@ impl GalaxyMode {
         self.time
     }
 
-    /// The midpoint between the two galaxy centres — a good camera target.
-    pub fn center(&self) -> Vec3 {
-        (self.positions[0] + self.positions[self.n_a]) * 0.5
-    }
-
-    /// Turn the particles into a coloured point cloud, relative to `center`.
-    ///
-    /// What: one [`PointInstance`] per particle (bright cores, faint blue disk for
-    /// galaxy A and faint warm disk for galaxy B).
-    /// How/why: additive faint dots overlap into a glowing sheet; two colours make
-    /// the mixing and the tidal tails easy to follow. Positions are shifted by the
-    /// camera target so they sit around the origin for the renderer.
-    /// Units: `center` scale-free; output positions in the renderer's frame, sizes
-    /// in pixels, colours linear RGBA.
-    pub fn points(&self, center: Vec3) -> Vec<PointInstance> {
-        let mut out = Vec::with_capacity(self.positions.len());
-        for (i, p) in self.positions.iter().enumerate() {
-            let rel = *p - center;
-            let core = i == 0 || i == self.n_a;
-            let (color, size) = if core {
-                ([1.0, 1.0, 0.9, 1.0], 8.0)
-            } else if i < self.n_a {
-                ([0.55, 0.72, 1.0, 0.62], 1.8)
-            } else {
-                ([1.0, 0.7, 0.42, 0.62], 1.8)
-            };
-            out.push(PointInstance {
-                pos: [rel.x, rel.y, rel.z],
-                size,
-                color,
-            });
-        }
-        out
-    }
 }

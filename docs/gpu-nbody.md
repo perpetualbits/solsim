@@ -395,8 +395,15 @@ depends on the tree height, which we don't know without looking; rather than rea
 flag back each level, we just run a **fixed 64 passes** — comfortably more than the
 `~30 + log₂N` a Morton tree can ever be deep, and extra passes are free no-ops. And
 the traversal stack is a fixed 64 entries for the same reason. So the entire step is
-GPU-only; the *only* thing that ever comes back is the **position buffer, once per
-frame, to draw** (`galaxy_mode.rs` mirrors it to colour the point cloud).
+GPU-only.
+
+**And nothing comes back at all.** The point renderer draws **straight from the
+position buffer**: a vertex shader reads `pos[instance_index]`, colours it by index
+(the two galaxies split at `n_a`, bright cores at `0` and `n_a`), and even computes the
+framing centre itself from `pos[0]` and `pos[n_a]` — every vertex reads those same two
+cached addresses, so it is essentially free. That removes the per-frame position
+readback, the CPU loop that rebuilt a point per particle, and the re-upload — which at
+a million particles is the difference between a smooth frame and a stalled one.
 
 ### Trusting it
 
