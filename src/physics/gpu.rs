@@ -1283,6 +1283,750 @@ pub fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some((device, queue))
 }
 
+// ===========================================================================
+// Resident stepper: the whole leapfrog step on the GPU, no per-stage readback.
+// ===========================================================================
+//
+// The functions above each build one stage and read it back — perfect for testing,
+// wasteful for real time. `GpuNBody` instead keeps *every* buffer resident and runs
+// one leapfrog step (kick–drift, rebuild the tree, walk it, kick) as a single command
+// submission. The five validated shaders are reused verbatim; a handful of tiny
+// "glue" kernels below move data between them on the card (integrate, a Morton that
+// reads the box from a buffer, sort setup, gather into sorted order, seed the leaves,
+// scatter the forces back). The only thing that ever comes back to the CPU is the
+// position buffer, once per frame, to draw.
+
+/// Kick-1 + drift: `v ← v + a·½dt`, then `x ← x + v·dt`. One thread per particle.
+const INTEGRATE_PRE_SHADER: &str = r#"
+struct U { n: u32, half: f32, dt: f32, _p: f32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> acc: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> vel: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> pos: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= u.n) { return; }
+    let v = vel[i].xyz + acc[i].xyz * u.half;   // kick with the old acceleration
+    let p = pos[i].xyz + v * u.dt;              // drift with the half-kicked velocity
+    vel[i] = vec4<f32>(v, 0.0);
+    pos[i] = vec4<f32>(p, 0.0);
+}
+"#;
+
+/// Kick-2: `v ← v + a·½dt` with the freshly computed acceleration.
+const INTEGRATE_POST_SHADER: &str = r#"
+struct U { n: u32, half: f32, dt: f32, _p: f32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> acc: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> vel: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= u.n) { return; }
+    vel[i] = vec4<f32>(vel[i].xyz + acc[i].xyz * u.half, 0.0);
+}
+"#;
+
+/// Morton codes, reading the bounding box from GPU buffers (see [`MORTON_SHADER`]).
+const MORTON_RESIDENT_SHADER: &str = r#"
+struct U { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> box_lo: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> box_hi: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> codes: array<u32>;
+fn expand_bits(v: u32) -> u32 {
+    var x = v & 0x3ffu;
+    x = (x | (x << 16u)) & 0x030000ffu;
+    x = (x | (x << 8u)) & 0x0300f00fu;
+    x = (x | (x << 4u)) & 0x030c30c3u;
+    x = (x | (x << 2u)) & 0x09249249u;
+    return x;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= u.n) { return; }
+    let lo = box_lo[0].xyz;
+    let hi = box_hi[0].xyz;
+    let inv = 1.0 / max(hi - lo, vec3<f32>(1e-20, 1e-20, 1e-20));
+    let q = clamp((pos[i].xyz - lo) * inv, vec3<f32>(0.0), vec3<f32>(1.0));
+    let xi = u32(q.x * 1023.0);
+    let yi = u32(q.y * 1023.0);
+    let zi = u32(q.z * 1023.0);
+    codes[i] = (expand_bits(xi) << 2u) | (expand_bits(yi) << 1u) | expand_bits(zi);
+}
+"#;
+
+/// Fill the padded sort arrays: real `(code, index)` for the first `n`, sentinels
+/// after (so they sort to the end, exactly as [`bitonic_sort_gpu`] does on the CPU).
+const SORTSETUP_SHADER: &str = r#"
+struct U { n: u32, m: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> codes: array<u32>;
+@group(0) @binding(2) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(3) var<storage, read_write> vals: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= u.m) { return; }
+    if (i < u.n) {
+        keys[i] = codes[i];
+        vals[i] = i;
+    } else {
+        keys[i] = 0xffffffffu;
+        vals[i] = 0xffffffffu;
+    }
+}
+"#;
+
+/// Gather particles into Morton (leaf) order: `leaf[k] = particle[ vals[k] ]`.
+const GATHER_SHADER: &str = r#"
+struct U { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> mass: array<f32>;
+@group(0) @binding(3) var<storage, read> vals: array<u32>;
+@group(0) @binding(4) var<storage, read_write> leaf_pos: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> leaf_mass: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= u.n) { return; }
+    let o = vals[k];
+    leaf_pos[k] = pos[o];
+    leaf_mass[k] = mass[o];
+}
+"#;
+
+/// Seed the tree for a fresh refit: leaves get their particle's mass/COM/box and are
+/// marked finished; internal nodes are marked unfinished. One thread per node.
+const AGGSEED_SHADER: &str = r#"
+struct U { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> leaf_pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> leaf_mass: array<f32>;
+@group(0) @binding(3) var<storage, read_write> node_mass: array<f32>;
+@group(0) @binding(4) var<storage, read_write> node_com: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> node_lo: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> node_hi: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> done_a: array<u32>;
+@group(0) @binding(8) var<storage, read_write> done_b: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let id = gid.x;
+    let total = 2u * u.n - 1u;
+    if (id >= total) { return; }
+    let leaf_base = u.n - 1u;
+    if (id >= leaf_base) {
+        let k = id - leaf_base;
+        let p = leaf_pos[k].xyz;
+        node_mass[id] = leaf_mass[k];
+        node_com[id] = vec4<f32>(p, leaf_mass[k]);
+        node_lo[id] = vec4<f32>(p, 0.0);
+        node_hi[id] = vec4<f32>(p, 0.0);
+        done_a[id] = 1u;
+        done_b[id] = 1u;
+    } else {
+        done_a[id] = 0u;
+        done_b[id] = 0u;
+    }
+}
+"#;
+
+/// Scatter the per-leaf accelerations back to the original particle order.
+const SCATTER_SHADER: &str = r#"
+struct U { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> vals: array<u32>;
+@group(0) @binding(2) var<storage, read> acc_sorted: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> acc: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= u.n) { return; }
+    acc[vals[k]] = acc_sorted[k];
+}
+"#;
+
+/// How many refit levels to run each step. The frontier rises one level per pass, so
+/// this must exceed the tree's height; a Morton+index tree over `n` leaves is at most
+/// ~`30 + log₂ n` deep, so 64 covers well past the 100k-body target. Extra passes are
+/// harmless no-ops (already-finished nodes just carry forward).
+const REFIT_PASSES: usize = 64;
+
+/// A fully GPU-resident Barnes–Hut N-body simulation.
+///
+/// What: owns the particle state (positions, velocities, accelerations, masses) and
+/// all the tree scratch in GPU buffers, and steps the whole system with leapfrog on
+/// the card — no data crosses to the CPU except the positions, read once per frame to
+/// draw.
+/// How/why: [`step`](Self::step) encodes the entire kick–drift–force–kick sequence as
+/// compute passes into one command buffer and submits it once. Rebuilding the tree
+/// every step reuses the validated pipeline (box → codes → sort → LBVH → mass/COM/box
+/// → walk); the pass boundaries give the ordering, so there is nothing to synchronise
+/// by hand. Buffer sizes are fixed by `n`, so everything is allocated once up front.
+/// Units: the caller's (scale-free `G = 1` in the galaxy mode).
+pub struct GpuNBody {
+    n: usize,
+    // State (original particle order).
+    pos: wgpu::Buffer,
+    vel: wgpu::Buffer,
+    acc: wgpu::Buffer,
+    // Uniforms.
+    uni_n: wgpu::Buffer,
+    uni_sort: wgpu::Buffer,
+    uni_trav: wgpu::Buffer,
+    uni_integ: wgpu::Buffer,
+    bitonic_params: wgpu::Buffer,
+    bitonic_passes: usize,
+    // Pipelines.
+    p_pre: wgpu::ComputePipeline,
+    p_post: wgpu::ComputePipeline,
+    p_bbox: wgpu::ComputePipeline,
+    p_morton: wgpu::ComputePipeline,
+    p_setup: wgpu::ComputePipeline,
+    p_bitonic: wgpu::ComputePipeline,
+    p_gather: wgpu::ComputePipeline,
+    p_seed: wgpu::ComputePipeline,
+    p_lbvh: wgpu::ComputePipeline,
+    p_agg: wgpu::ComputePipeline,
+    p_trav: wgpu::ComputePipeline,
+    p_scatter: wgpu::ComputePipeline,
+    // Bind groups.
+    b_pre: wgpu::BindGroup,
+    b_post: wgpu::BindGroup,
+    b_bbox: wgpu::BindGroup,
+    b_morton: wgpu::BindGroup,
+    b_setup: wgpu::BindGroup,
+    b_bitonic: wgpu::BindGroup,
+    b_gather: wgpu::BindGroup,
+    b_seed: wgpu::BindGroup,
+    b_lbvh: wgpu::BindGroup,
+    b_agg_ab: wgpu::BindGroup,
+    b_agg_ba: wgpu::BindGroup,
+    b_trav: wgpu::BindGroup,
+    b_scatter: wgpu::BindGroup,
+    // Readback for drawing.
+    pos_readback: wgpu::Buffer,
+}
+
+impl GpuNBody {
+    /// Build the resident simulation and compute the starting accelerations.
+    ///
+    /// What: uploads the particles, allocates every scratch buffer, wires up all the
+    /// pipelines, and primes `acc` so the first [`step`](Self::step) is a valid kick.
+    /// How/why: sizes come straight from `n` (leaves `n`, nodes `2n-1`, sort padded to
+    /// the next power of two), so this is a one-time setup; the per-step work then
+    /// allocates nothing.
+    /// Units: as the struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: &[Vec3],
+        vel: &[Vec3],
+        mass: &[f32],
+        theta: f32,
+        softening: f32,
+        g: f32,
+    ) -> Self {
+        let n = pos.len();
+        assert!(n >= 2, "need at least two particles");
+        assert_eq!(vel.len(), n);
+        assert_eq!(mass.len(), n);
+        let total = 2 * n - 1;
+        let internal = n - 1;
+        let m = n.next_power_of_two();
+
+        let pos4: Vec<[f32; 4]> = pos.iter().map(|p| [p.x, p.y, p.z, 0.0]).collect();
+        let vel4: Vec<[f32; 4]> = vel.iter().map(|v| [v.x, v.y, v.z, 0.0]).collect();
+
+        // --- state buffers ---
+        let storage = wgpu::BufferUsages::STORAGE;
+        let sc = storage | wgpu::BufferUsages::COPY_SRC;
+        let init = |data: &[u8], usage, label| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: data,
+                usage,
+            })
+        };
+        let zeros = |bytes: u64, usage, label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let pos_buf = init(bytemuck::cast_slice(&pos4), sc | wgpu::BufferUsages::COPY_DST, "pos");
+        let vel_buf = init(bytemuck::cast_slice(&vel4), storage, "vel");
+        let acc_buf = zeros((n * 16) as u64, storage, "acc");
+        let mass_buf = init(bytemuck::cast_slice(mass), storage, "mass");
+
+        // --- scratch buffers ---
+        let box_lo = zeros(16, storage, "box lo");
+        let box_hi = zeros(16, storage, "box hi");
+        let codes = zeros((n * 4) as u64, storage, "codes");
+        let keys = zeros((m * 4) as u64, storage, "keys");
+        let vals = zeros((m * 4) as u64, storage, "vals");
+        let leaf_pos = zeros((n * 16) as u64, storage, "leaf pos");
+        let leaf_mass = zeros((n * 4) as u64, storage, "leaf mass");
+        let lft = zeros((internal * 4) as u64, storage, "lft");
+        let rgt = zeros((internal * 4) as u64, storage, "rgt");
+        let par = zeros((total * 4) as u64, storage, "par"); // written by LBVH, unused after
+        let node_mass = zeros((total * 4) as u64, storage, "node mass");
+        let node_com = zeros((total * 16) as u64, storage, "node com");
+        let node_lo = zeros((total * 16) as u64, storage, "node lo");
+        let node_hi = zeros((total * 16) as u64, storage, "node hi");
+        let done_a = zeros((total * 4) as u64, storage, "done a");
+        let done_b = zeros((total * 4) as u64, storage, "done b");
+        let acc_sorted = zeros((n * 16) as u64, storage, "acc sorted");
+        let pos_readback = readback_buffer(device, (n * 16) as u64);
+
+        // --- uniforms ---
+        let uni_n = init(bytemuck::cast_slice(&[n as u32, 0, 0, 0]), wgpu::BufferUsages::UNIFORM, "uni n");
+        let uni_sort = init(
+            bytemuck::cast_slice(&[n as u32, m as u32, 0, 0]),
+            wgpu::BufferUsages::UNIFORM,
+            "uni sort",
+        );
+        let trav = Uniforms { n: n as u32, theta2: theta * theta, soft2: softening * softening, g };
+        let uni_trav = init(bytemuck::bytes_of(&trav), wgpu::BufferUsages::UNIFORM, "uni trav");
+        let uni_integ = init(
+            bytemuck::cast_slice(&[f32::from_bits(n as u32), 0.0f32, 0.0f32, 0.0f32]),
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "uni integ",
+        );
+
+        // Bitonic schedule packed as 256-byte-aligned uniform blocks with a dynamic
+        // offset per sub-pass (identical to `bitonic_sort_gpu`).
+        const STRIDE: usize = 256;
+        let mut schedule: Vec<(u32, u32)> = Vec::new();
+        let mut kk = 2usize;
+        while kk <= m {
+            let mut j = kk / 2;
+            while j >= 1 {
+                schedule.push((j as u32, kk as u32));
+                j /= 2;
+            }
+            kk *= 2;
+        }
+        let mut params = vec![0u8; schedule.len().max(1) * STRIDE];
+        for (idx, &(j, k)) in schedule.iter().enumerate() {
+            let base = idx * STRIDE;
+            params[base..base + 4].copy_from_slice(&j.to_le_bytes());
+            params[base + 4..base + 8].copy_from_slice(&k.to_le_bytes());
+            params[base + 8..base + 12].copy_from_slice(&(m as u32).to_le_bytes());
+        }
+        let bitonic_params =
+            init(&params, wgpu::BufferUsages::UNIFORM, "bitonic params");
+
+        // --- pipelines + bind groups ---
+        let mk = |src, entries: &[wgpu::BindGroupLayoutEntry], label: &str| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+            });
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries,
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            (pipe, layout)
+        };
+        let bind = |layout: &wgpu::BindGroupLayout, res: &[&wgpu::Buffer], label: &str| {
+            let entries: Vec<wgpu::BindGroupEntry> = res
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &entries,
+            })
+        };
+
+        let (p_pre, l_pre) = mk(
+            INTEGRATE_PRE_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false)],
+            "pre",
+        );
+        let b_pre = bind(&l_pre, &[&uni_integ, &acc_buf, &vel_buf, &pos_buf], "pre");
+
+        let (p_post, l_post) = mk(
+            INTEGRATE_POST_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false)],
+            "post",
+        );
+        let b_post = bind(&l_post, &[&uni_integ, &acc_buf, &vel_buf], "post");
+
+        let (p_bbox, l_bbox) = mk(
+            BBOX_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false)],
+            "bbox",
+        );
+        let b_bbox = bind(&l_bbox, &[&uni_n, &pos_buf, &box_lo, &box_hi], "bbox");
+
+        let (p_morton, l_morton) = mk(
+            MORTON_RESIDENT_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, false),
+            ],
+            "morton",
+        );
+        let b_morton = bind(&l_morton, &[&uni_n, &pos_buf, &box_lo, &box_hi, &codes], "morton");
+
+        let (p_setup, l_setup) = mk(
+            SORTSETUP_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false)],
+            "setup",
+        );
+        let b_setup = bind(&l_setup, &[&uni_sort, &codes, &keys, &vals], "setup");
+
+        // Bitonic reuses the shared shader but with a dynamic-offset uniform.
+        let (p_bitonic, b_bitonic) = {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("bitonic"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BITONIC_SHADER)),
+            });
+            let mut ulayout = uniform_entry(0);
+            ulayout.ty = wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: std::num::NonZeroU64::new(16),
+            };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bitonic"),
+                entries: &[ulayout, storage_entry(1, false), storage_entry(2, false)],
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("bitonic"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("bitonic"),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bitonic"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &bitonic_params,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(16),
+                        }),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: keys.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: vals.as_entire_binding() },
+                ],
+            });
+            (pipe, bg)
+        };
+
+        let (p_gather, l_gather) = mk(
+            GATHER_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, false),
+                storage_entry(5, false),
+            ],
+            "gather",
+        );
+        let b_gather = bind(
+            &l_gather,
+            &[&uni_n, &pos_buf, &mass_buf, &vals, &leaf_pos, &leaf_mass],
+            "gather",
+        );
+
+        let (p_seed, l_seed) = mk(
+            AGGSEED_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, false),
+                storage_entry(4, false),
+                storage_entry(5, false),
+                storage_entry(6, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
+            ],
+            "seed",
+        );
+        let b_seed = bind(
+            &l_seed,
+            &[
+                &uni_n, &leaf_pos, &leaf_mass, &node_mass, &node_com, &node_lo, &node_hi, &done_a,
+                &done_b,
+            ],
+            "seed",
+        );
+
+        let (p_lbvh, l_lbvh) = mk(
+            LBVH_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                storage_entry(3, false),
+                storage_entry(4, false),
+            ],
+            "lbvh",
+        );
+        let b_lbvh = bind(&l_lbvh, &[&uni_n, &keys, &lft, &rgt, &par], "lbvh");
+
+        let (p_agg, l_agg) = mk(
+            AGGREGATE_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, false),
+                storage_entry(4, false),
+                storage_entry(5, true),
+                storage_entry(6, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
+            ],
+            "agg",
+        );
+        let agg_bind = |din: &wgpu::Buffer, dout: &wgpu::Buffer| {
+            bind(
+                &l_agg,
+                &[&uni_n, &lft, &rgt, &node_mass, &node_com, din, dout, &node_lo, &node_hi],
+                "agg",
+            )
+        };
+        let b_agg_ab = agg_bind(&done_a, &done_b);
+        let b_agg_ba = agg_bind(&done_b, &done_a);
+
+        let (p_trav, l_trav) = mk(
+            TRAVERSE_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, true),
+                storage_entry(5, true),
+                storage_entry(6, true),
+                storage_entry(7, false),
+            ],
+            "trav",
+        );
+        let b_trav = bind(
+            &l_trav,
+            &[&uni_trav, &node_mass, &node_com, &node_lo, &node_hi, &lft, &rgt, &acc_sorted],
+            "trav",
+        );
+
+        let (p_scatter, l_scatter) = mk(
+            SCATTER_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false)],
+            "scatter",
+        );
+        let b_scatter = bind(&l_scatter, &[&uni_n, &vals, &acc_sorted, &acc_buf], "scatter");
+
+        let sim = GpuNBody {
+            n,
+            pos: pos_buf,
+            vel: vel_buf,
+            acc: acc_buf,
+            uni_n,
+            uni_sort,
+            uni_trav,
+            uni_integ,
+            bitonic_params,
+            bitonic_passes: schedule.len(),
+            p_pre,
+            p_post,
+            p_bbox,
+            p_morton,
+            p_setup,
+            p_bitonic,
+            p_gather,
+            p_seed,
+            p_lbvh,
+            p_agg,
+            p_trav,
+            p_scatter,
+            b_pre,
+            b_post,
+            b_bbox,
+            b_morton,
+            b_setup,
+            b_bitonic,
+            b_gather,
+            b_seed,
+            b_lbvh,
+            b_agg_ab,
+            b_agg_ba,
+            b_trav,
+            b_scatter,
+            pos_readback,
+        };
+        // Prime the accelerations so the first kick is valid.
+        sim.recompute_forces(device, queue);
+        sim
+    }
+
+    /// Encode the force calculation (tree rebuild + walk) into an existing encoder.
+    ///
+    /// What: appends every stage from bounding box to the scatter that writes the
+    /// fresh accelerations into `acc`.
+    /// How/why: each stage is its own compute pass, so wgpu inserts the barriers that
+    /// make one stage's writes visible to the next; the refit is run a fixed
+    /// [`REFIT_PASSES`] times (no readback needed to know when it converged).
+    /// Units: none.
+    fn encode_forces(&self, enc: &mut wgpu::CommandEncoder) {
+        let gn = (self.n as u32).div_ceil(64);
+        let gtot = ((2 * self.n - 1) as u32).div_ceil(64);
+        let gm = (self.n.next_power_of_two() as u32).div_ceil(64);
+        // A single dispatch in its own compute pass (the pass boundary is the barrier).
+        fn one(
+            enc: &mut wgpu::CommandEncoder,
+            pipe: &wgpu::ComputePipeline,
+            bg: &wgpu::BindGroup,
+            offset: &[u32],
+            groups: u32,
+        ) {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            p.set_pipeline(pipe);
+            p.set_bind_group(0, bg, offset);
+            p.dispatch_workgroups(groups, 1, 1);
+        }
+        one(enc, &self.p_bbox, &self.b_bbox, &[], 1); // single-workgroup reduction
+        one(enc, &self.p_morton, &self.b_morton, &[], gn);
+        one(enc, &self.p_setup, &self.b_setup, &[], gm);
+        // Bitonic: one pass per sub-pass, selecting its (j,k) by dynamic offset.
+        for idx in 0..self.bitonic_passes {
+            one(enc, &self.p_bitonic, &self.b_bitonic, &[(idx * 256) as u32], gm);
+        }
+        one(enc, &self.p_gather, &self.b_gather, &[], gn);
+        one(enc, &self.p_seed, &self.b_seed, &[], gtot);
+        one(enc, &self.p_lbvh, &self.b_lbvh, &[], gn);
+        for i in 0..REFIT_PASSES {
+            let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
+            one(enc, &self.p_agg, bg, &[], gtot);
+        }
+        one(enc, &self.p_trav, &self.b_trav, &[], gn);
+        one(enc, &self.p_scatter, &self.b_scatter, &[], gn);
+    }
+
+    /// Compute accelerations for the current positions (used once at start-up).
+    fn recompute_forces(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("forces") });
+        self.encode_forces(&mut enc);
+        queue.submit(Some(enc.finish()));
+    }
+
+    /// Advance the whole system by one leapfrog step of size `dt`, on the GPU.
+    ///
+    /// What: kick-drift with the stored acceleration, rebuild the tree and recompute
+    /// the acceleration, then the second kick — all in one command submission.
+    /// How/why: `acc` already holds the acceleration at the current positions (from
+    /// start-up or the previous step), so the split kick is valid; nothing is read
+    /// back, so the CPU never waits mid-step.
+    /// Units: `dt` in the caller's time unit.
+    pub fn step(&self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
+        // Refresh the integrator uniform (n reinterpreted as a float bit-pattern in
+        // the shader's u32 slot; half and dt are real floats).
+        let half = 0.5 * dt;
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&(self.n as u32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&half.to_le_bytes());
+        bytes[8..12].copy_from_slice(&dt.to_le_bytes());
+        queue.write_buffer(&self.uni_integ, 0, &bytes);
+
+        let gn = (self.n as u32).div_ceil(64);
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("step") });
+        {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("kick+drift"),
+                timestamp_writes: None,
+            });
+            p.set_pipeline(&self.p_pre);
+            p.set_bind_group(0, &self.b_pre, &[]);
+            p.dispatch_workgroups(gn, 1, 1);
+        }
+        self.encode_forces(&mut enc);
+        {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("kick"),
+                timestamp_writes: None,
+            });
+            p.set_pipeline(&self.p_post);
+            p.set_bind_group(0, &self.b_post, &[]);
+            p.dispatch_workgroups(gn, 1, 1);
+        }
+        queue.submit(Some(enc.finish()));
+    }
+
+    /// Copy the positions back to the CPU (once per frame, to draw).
+    ///
+    /// What: returns the current position of every particle, in the original order.
+    /// How/why: the only place data leaves the GPU — one copy of the position buffer
+    /// into a mapped staging buffer. Everything else stays resident.
+    /// Units: the caller's length.
+    pub fn positions(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<Vec3> {
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        enc.copy_buffer_to_buffer(&self.pos, 0, &self.pos_readback, 0, (self.n * 16) as u64);
+        queue.submit(Some(enc.finish()));
+        let flat = map_f32(device, &self.pos_readback, self.n * 4);
+        flat.chunks_exact(4).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
+    }
+
+    /// Number of particles.
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// Whether the system is empty (never, but clippy likes the pair).
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,6 +2373,67 @@ mod tests {
         let mean = sum_rel / n as f32;
         assert!(mean < 0.01, "mean relative error {mean} too high");
         assert!(worst < 0.15, "worst relative error {worst} too high");
+    }
+
+    /// The resident GPU leapfrog must track the CPU leapfrog step for step.
+    ///
+    /// Both integrate the *same* initial conditions with exact forces (θ = 0, so the
+    /// GPU tree opens down to every leaf and matches the direct sum), so after many
+    /// steps their particles should still sit almost on top of each other — only f32
+    /// summation-order rounding separates them. This exercises the whole resident
+    /// pipeline: kick–drift, tree rebuild, gather into Morton order, walk, scatter
+    /// back, second kick — any mistake in that plumbing shows up as drift.
+    #[test]
+    fn resident_stepper_matches_cpu_leapfrog() {
+        use crate::physics::particles::Particles;
+
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x2468_0ACE_1357_9BDF);
+        let n = 400usize;
+        let soft = 0.1f32;
+        let g = 1.0f32;
+        let dt = 0.005f32;
+
+        let mut pos = Vec::with_capacity(n);
+        let mut vel = Vec::with_capacity(n);
+        for _ in 0..n {
+            pos.push(Vec3::new(
+                rng.unit() as f32 * 2.0 - 1.0,
+                rng.unit() as f32 * 2.0 - 1.0,
+                rng.unit() as f32 * 2.0 - 1.0,
+            ));
+            vel.push(Vec3::new(
+                rng.unit() as f32 - 0.5,
+                rng.unit() as f32 - 0.5,
+                rng.unit() as f32 - 0.5,
+            ) * 0.1);
+        }
+        let mass = vec![1.0f32; n];
+
+        let mut cpu = Particles::new(pos.clone(), vel.clone(), mass.clone(), 0.0, soft, g);
+        let gpu = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.0, soft, g);
+
+        let steps = 50;
+        for _ in 0..steps {
+            cpu.step(dt);
+            gpu.step(&device, &queue, dt);
+        }
+        let gpos = gpu.positions(&device, &queue);
+
+        let mut sum = 0.0f32;
+        let mut worst = 0.0f32;
+        for i in 0..n {
+            let d = (gpos[i] - cpu.pos[i]).length();
+            sum += d;
+            worst = worst.max(d);
+        }
+        let mean = sum / n as f32;
+        // The cluster spans ~2 units; exact-force leapfrogs must stay within a whisker.
+        assert!(mean < 0.02, "mean position drift {mean} too high");
+        assert!(worst < 0.1, "worst position drift {worst} too high");
     }
 
     use wgpu::util::DeviceExt;
