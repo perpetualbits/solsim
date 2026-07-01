@@ -32,7 +32,7 @@ into clean, separately-testable phases:
 | 5b | node mass/COM | aggregate up the tree |
 | 6 | traverse + integrate | the actual gravity + leapfrog step |
 
-Phases 0, 3, 4, 5a and 5b are implemented and validated so far.
+Phases 0, 2, 3, 4, 5a and 5b are implemented and validated so far.
 
 ## 2. A short GPU-compute crash course (wgpu)
 
@@ -272,10 +272,45 @@ plain sum of all leaf masses** and its COM is the mass-weighted mean — the pro
 that must hold if nothing leaked. (This is the test that failed loudly on the atomic
 version, which is exactly why we trust the level version.)
 
-## 7. Still to come
+## 7. Phase 2 — the bounding box (a parallel reduction)
 
-- **Phase 2 — bounding box** on the GPU (a parallel reduction), so the Morton step
-  no longer needs a CPU-computed box.
+The Morton step (§3) needs the box `[lo, hi]` that contains every particle, to
+normalise positions into the unit cube. Until now the CPU computed it; this phase
+does it on the GPU so the whole build can stay on the card.
+
+Finding the min and max over an array is a **reduction** — the same shape as summing
+an array, but with `min`/`max` instead of `+`. Both are associative and commutative,
+so we may combine elements in *any* order, which is exactly what lets a GPU do it in
+parallel (`BBOX_SHADER`, `bounding_box_gpu`).
+
+We use a **single workgroup of 256 threads** in two steps:
+
+1. **Grid-stride fold.** Thread `t` walks the array in steps of 256 (elements `t`,
+   `t+256`, `t+512`, …), keeping a private running `(min, max)`. This is what lets
+   `n` be far bigger than 256 — each thread just folds more elements. Threads that
+   run past the end start from `±f32::MAX`, the identity for min/max, so they
+   contribute nothing.
+2. **Halving tree in shared memory.** The 256 private results are written to
+   workgroup-shared scratch, then combined pairwise: 256→128→64→…→1, halving the
+   live lanes each round, until thread 0 holds the box, which it writes out.
+
+Here a plain **`workgroupBarrier()`** between rounds is enough — unlike the tree
+refit in §6, everything happens inside *one* workgroup, and workgroup-shared memory
+with that barrier *is* covered by the memory model. That contrast is the whole point:
+`workgroupBarrier` synchronises threads within a workgroup; crossing workgroups needs
+a submit/pass boundary. Choosing the right one for the job is most of what makes GPU
+code correct.
+
+For our `n` (tens of thousands to a few million), one workgroup striding the array is
+already fast; a huge array would instead use many workgroups writing partial boxes
+and a second tiny pass to combine them.
+
+`gpu_bounding_box_matches_cpu` checks the result against a plain CPU min/max over
+12 345 random points (not a multiple of 256, so the strided tail is exercised). The
+box corners are exact copies of input floats, so the comparison is exact.
+
+## 8. Still to come
+
 - **Phase 6 — traverse + integrate**: one thread per particle walks the tree
   (lump-or-open using each node's mass/COM/size, just like the CPU version), then a
   leapfrog kick-drift-kick updates the resident position/velocity buffers, which the

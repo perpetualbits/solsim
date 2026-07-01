@@ -766,6 +766,161 @@ pub fn aggregate_nodes_gpu(
     (mass, com)
 }
 
+const BBOX_SHADER: &str = r#"
+struct Uni { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var<storage, read> pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> out_lo: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> out_hi: array<vec4<f32>>;
+
+const WG: u32 = 256u;
+const BIG: f32 = 3.4028235e38;   // ~f32::MAX, the identity for min/max
+
+// Scratch shared by the 256 threads of the single workgroup.
+var<workgroup> slo: array<vec3<f32>, 256>;
+var<workgroup> shi: array<vec3<f32>, 256>;
+
+// Find the axis-aligned box that contains all particles, as a parallel reduction.
+// One workgroup: each of the 256 threads first folds its own strided slice of the
+// array into a private (min,max), then the threads combine pairwise in shared memory
+// (a halving tree) until thread 0 holds the answer. Reduction is correct in any
+// order because min/max are associative and commutative.
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    var lo = vec3<f32>(BIG, BIG, BIG);
+    var hi = vec3<f32>(-BIG, -BIG, -BIG);
+    var i = t;
+    loop {
+        if (i >= u.n) { break; }
+        let p = pos[i].xyz;
+        lo = min(lo, p);
+        hi = max(hi, p);
+        i = i + WG;                 // grid-stride: thread t handles t, t+256, t+512, …
+    }
+    slo[t] = lo;
+    shi[t] = hi;
+    workgroupBarrier();
+
+    // Halving tree: 256→128→…→1 live lanes, each barrier making the writes visible.
+    var stride = WG / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            slo[t] = min(slo[t], slo[t + stride]);
+            shi[t] = max(shi[t], shi[t + stride]);
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (t == 0u) {
+        out_lo[0] = vec4<f32>(slo[0], 0.0);
+        out_hi[0] = vec4<f32>(shi[0], 0.0);
+    }
+}
+"#;
+
+/// Compute the axis-aligned bounding box of all particle positions on the GPU.
+///
+/// What: returns `(lo, hi)`, the per-axis minimum and maximum over every particle —
+/// the cube the Morton step normalises into.
+/// How/why: a parallel reduction in a single workgroup. Each thread first folds a
+/// strided slice of the array into a private min/max (so `n` can be far larger than
+/// the 256 threads), then the threads combine pairwise through shared memory until
+/// thread 0 holds the total. Min and max are associative, so any combination order
+/// gives the same result. `workgroupBarrier()` is enough here because everything
+/// happens inside one workgroup — no cross-workgroup visibility problem (contrast
+/// the level-by-level refit in [`aggregate_nodes_gpu`]).
+/// Units: whatever the positions use (AU here); the `.w` lane is ignored.
+pub fn bounding_box_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    positions: &[[f32; 4]],
+) -> (Vec3, Vec3) {
+    let n = positions.len();
+    assert!(n >= 1, "need at least one particle");
+
+    let uni = [n as u32, 0, 0, 0];
+    let uni_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bbox uni"),
+        contents: bytemuck::cast_slice(&uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bbox pos"),
+        contents: bytemuck::cast_slice(positions),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out = |label| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let lo_buf = out("bbox lo");
+    let hi_buf = out("bbox hi");
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bbox"),
+        source: wgpu::ShaderSource::Wgsl(BBOX_SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bbox layout"),
+        entries: &[
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, false),
+        ],
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bbox bind"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: pos_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: lo_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: hi_buf.as_entire_binding() },
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bbox pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("bbox pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1); // a single workgroup does the whole reduction
+    }
+    let lo_back = readback_buffer(device, 16);
+    let hi_back = readback_buffer(device, 16);
+    encoder.copy_buffer_to_buffer(&lo_buf, 0, &lo_back, 0, 16);
+    encoder.copy_buffer_to_buffer(&hi_buf, 0, &hi_back, 0, 16);
+    queue.submit(Some(encoder.finish()));
+
+    let lo = map_f32(device, &lo_back, 4);
+    let hi = map_f32(device, &hi_back, 4);
+    (Vec3::new(lo[0], lo[1], lo[2]), Vec3::new(hi[0], hi[1], hi[2]))
+}
+
 /// A `MAP_READ` buffer of `bytes` bytes.
 fn readback_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -972,6 +1127,44 @@ mod tests {
         }
         let expected: Vec<u32> = (0..n as u32).collect();
         assert_eq!(leaves, expected, "leaves not visited in sorted order");
+    }
+
+    /// The GPU bounding-box reduction must match a plain CPU min/max over the points.
+    ///
+    /// `n` is deliberately not a multiple of the 256-thread workgroup, so the
+    /// grid-stride tail (threads that fold a different number of elements) is
+    /// exercised. Min/max are exact integers of the float inputs, so we compare for
+    /// exact equality.
+    #[test]
+    fn gpu_bounding_box_matches_cpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x00C0_FFEE_1234_5678);
+        let n = 12345; // not a multiple of 256
+        let pos: Vec<[f32; 4]> = (0..n)
+            .map(|_| {
+                [
+                    rng.unit() as f32 * 20.0 - 7.0,
+                    rng.unit() as f32 * 9.0 - 5.0,
+                    rng.unit() as f32 * 13.0 - 2.0,
+                    0.0,
+                ]
+            })
+            .collect();
+
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for p in &pos {
+            let v = Vec3::new(p[0], p[1], p[2]);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+
+        let (glo, ghi) = bounding_box_gpu(&device, &queue, &pos);
+        assert_eq!(glo, lo, "GPU lo differs from CPU");
+        assert_eq!(ghi, hi, "GPU hi differs from CPU");
     }
 
     /// The GPU bottom-up aggregate (mass + centre of mass) must match a CPU refit of
