@@ -8,6 +8,7 @@
 pub mod energy;
 pub mod forces;
 pub mod galaxy_ic;
+pub mod gpu;
 pub mod nbody;
 pub mod octree;
 pub mod particles;
