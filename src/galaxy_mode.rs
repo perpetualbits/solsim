@@ -23,8 +23,9 @@ const N_DISK: usize = 30_000;
 const DT: f32 = 0.05;
 /// Most simulation steps we will run in a single frame (the fast-forward cap).
 const MAX_STEPS_PER_FRAME: u32 = 32;
-/// Barnes–Hut opening angle (bigger = faster, a little rougher).
-const THETA: f32 = 0.6;
+/// Barnes–Hut opening angle (bigger = faster, a little rougher). 0.8 is a good
+/// visual/speed balance; adjustable live with the `[` / `]` keys.
+const THETA: f32 = 0.8;
 /// Gravitational softening (a length), so close particles do not blow up.
 const SOFTENING: f32 = 0.05;
 /// Gravitational constant in these scale-free units.
@@ -45,6 +46,7 @@ pub struct GalaxyMode {
     n_a: usize,
     time: f64,
     steps_per_frame: u32,
+    theta: f32,
 }
 
 impl GalaxyMode {
@@ -77,7 +79,25 @@ impl GalaxyMode {
             n_a,
             time: 0.0,
             steps_per_frame: 1,
+            theta: THETA,
         }
+    }
+
+    /// Current Barnes–Hut opening angle θ (for the on-screen readout).
+    pub fn theta(&self) -> f32 {
+        self.theta
+    }
+
+    /// Widen θ (faster, rougher). Capped so the tree still means something.
+    pub fn coarser(&mut self, queue: &wgpu::Queue) {
+        self.theta = (self.theta + 0.1).min(1.5);
+        self.sim.set_theta(queue, self.theta);
+    }
+
+    /// Narrow θ (slower, more accurate).
+    pub fn finer(&mut self, queue: &wgpu::Queue) {
+        self.theta = (self.theta - 0.1).max(0.2);
+        self.sim.set_theta(queue, self.theta);
     }
 
     /// Advance the simulation by one frame's worth of steps, then mirror positions.

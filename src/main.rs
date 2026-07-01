@@ -1470,6 +1470,7 @@ impl App {
         let sim_time = gm.time();
         let n = gm.len();
         let steps = gm.steps_per_frame();
+        let theta = gm.theta();
         self.galaxy = Some(gm);
 
         let fps = self.fps;
@@ -1504,10 +1505,12 @@ impl App {
                     ui.label(format!("Particles: {n}"));
                     ui.label(format!("Sim time: {sim_time:.1}"));
                     ui.label(format!("Speed: {steps}× steps/frame"));
+                    ui.label(format!("θ (accuracy): {theta:.1}"));
                     ui.label(format!("FPS: {fps:.0}"));
                     ui.separator();
                     ui.label("Drag — orbit    Wheel — zoom");
                     ui.label(".  /  ,  — faster / slower    C — grid");
+                    ui.label("[  /  ]  — finer / coarser gravity (θ)");
                     ui.label("X — back to the solar system");
                 });
         });
@@ -1774,8 +1777,26 @@ impl ApplicationHandler for App {
                             self.engine = Engine::Relativistic;
                         }
                         // GR strength ×10 / ÷10, to exaggerate the precession.
-                        "]" => self.gr_strength = (self.gr_strength * 10.0).min(1.0e9),
-                        "[" => self.gr_strength = (self.gr_strength * 0.1).max(1.0e-3),
+                        // In galaxy mode these tune the opening angle θ; in the solar
+                        // system they scale the (exaggerated) GR correction strength.
+                        "]" => {
+                            if let (Some(gm), Some(gpu)) =
+                                (self.galaxy.as_mut(), self.gpu.as_ref())
+                            {
+                                gm.coarser(&gpu.queue);
+                            } else {
+                                self.gr_strength = (self.gr_strength * 10.0).min(1.0e9);
+                            }
+                        }
+                        "[" => {
+                            if let (Some(gm), Some(gpu)) =
+                                (self.galaxy.as_mut(), self.gpu.as_ref())
+                            {
+                                gm.finer(&gpu.queue);
+                            } else {
+                                self.gr_strength = (self.gr_strength * 0.1).max(1.0e-3);
+                            }
+                        }
                         "r" => self.trails.clear(),
                         "k" => {
                             if self.edu.is_some() {

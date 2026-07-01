@@ -1573,6 +1573,8 @@ pub struct GpuNBody {
     uni_integ: wgpu::Buffer,
     bitonic_params: wgpu::Buffer,
     bitonic_passes: usize,
+    soft2: f32,
+    g: f32,
     // Pipelines.
     p_pre: wgpu::ComputePipeline,
     p_post: wgpu::ComputePipeline,
@@ -1978,6 +1980,8 @@ impl GpuNBody {
             uni_integ,
             bitonic_params,
             bitonic_passes: schedule.len(),
+            soft2: softening * softening,
+            g,
             p_pre,
             p_post,
             p_bbox,
@@ -2108,6 +2112,23 @@ impl GpuNBody {
             p.dispatch_workgroups(gn, 1, 1);
         }
         queue.submit(Some(enc.finish()));
+    }
+
+    /// Change the Barnes–Hut opening angle θ live (bigger = faster, a bit rougher).
+    ///
+    /// What: rewrites the traversal uniform with the new `θ²`, so the next step lumps
+    /// nodes more (larger θ) or less (smaller θ) aggressively.
+    /// How/why: only the walk's accept test `size² < θ²·r²` uses θ, so a single small
+    /// uniform write is all it takes — no rebuild.
+    /// Units: `theta` dimensionless.
+    pub fn set_theta(&self, queue: &wgpu::Queue, theta: f32) {
+        let uni = Uniforms {
+            n: self.n as u32,
+            theta2: theta * theta,
+            soft2: self.soft2,
+            g: self.g,
+        };
+        queue.write_buffer(&self.uni_trav, 0, bytemuck::bytes_of(&uni));
     }
 
     /// Copy the positions back to the CPU (once per frame, to draw).
@@ -2634,7 +2655,12 @@ mod tests {
             return;
         };
         let mut rng = Rng::new(0xB16_5CA1E_0F16_1234);
-        let n = 60_002usize; // the galaxy's body count (2 × 30 000 disks + 2 cores)
+        // Override with SOLSIM_N to profile other sizes (e.g. a million).
+        let n = std::env::var("SOLSIM_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_002usize);
+        println!("profiling n = {n}");
         let mut pos = Vec::with_capacity(n);
         let mut vel = Vec::with_capacity(n);
         for _ in 0..n {
@@ -2646,7 +2672,11 @@ mod tests {
             vel.push(Vec3::ZERO);
         }
         let mass = vec![4.0f32 / n as f32; n];
-        let sim = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.6, 0.05, 1.0);
+        let theta = std::env::var("SOLSIM_THETA")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.6f32);
+        let sim = GpuNBody::new(&device, &queue, &pos, &vel, &mass, theta, 0.05, 1.0);
         for row in sim.profile(&device, &queue, 30) {
             println!("{:>14}  {:6.3} ms", row.0, row.1);
         }
