@@ -2017,6 +2017,9 @@ impl GpuNBody {
         enc.copy_buffer_to_buffer(&self.pos, 0, &self.pos_readback, 0, (self.n * 16) as u64);
         queue.submit(Some(enc.finish()));
         let flat = map_f32(device, &self.pos_readback, self.n * 4);
+        // The staging buffer is reused every frame, so it must be unmapped again
+        // before the next copy/submit — otherwise wgpu rejects the submit.
+        self.pos_readback.unmap();
         flat.chunks_exact(4).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
     }
 
@@ -2468,10 +2471,13 @@ mod tests {
         let mass = vec![1.0f32 / n as f32; n]; // light particles: gentle, bounded motion
 
         let gpu = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.6, 0.1, 1.0);
+        // Step *and read back* every iteration, exactly like the frame loop — this is
+        // what catches the reused staging buffer being left mapped between frames.
+        let mut out = Vec::new();
         for _ in 0..6 {
             gpu.step(&device, &queue, 0.01);
+            out = gpu.positions(&device, &queue);
         }
-        let out = gpu.positions(&device, &queue);
         assert_eq!(out.len(), n);
         for (i, p) in out.iter().enumerate() {
             assert!(p.is_finite(), "particle {i} went non-finite: {p:?}");
