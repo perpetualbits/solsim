@@ -17,6 +17,7 @@ use glam::DVec3;
 
 use crate::noise::fbm;
 use crate::render::starfield::StarInstance;
+use crate::rng::Rng;
 use crate::stars::project::{galactic_to_ecliptic, radec_to_ecliptic};
 
 /// How many faint stars make up the band.
@@ -312,62 +313,6 @@ fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// A tiny deterministic random-number generator (SplitMix64).
-///
-/// What: produces a repeatable stream of pseudo-random numbers from a seed.
-/// How/why: we need scattered-but-reproducible star positions without pulling in a
-/// random-number crate; SplitMix64 is a few lines and good enough for placing dots.
-/// Principle: hashing a steadily increasing counter yields well-mixed bits.
-/// Units: none.
-struct Rng(u64);
-
-impl Rng {
-    /// Start the generator from a fixed seed.
-    ///
-    /// What: creates an `Rng` whose stream is fully determined by `seed`.
-    /// How/why: a constant seed means the band looks the same every run.
-    /// Units: none.
-    fn new(seed: u64) -> Self {
-        Rng(seed)
-    }
-
-    /// Return the next 64 random bits (the SplitMix64 step).
-    ///
-    /// What: advances the internal counter and hashes it.
-    /// How/why: add the golden-ratio constant, then two xor-shift-multiply rounds
-    /// scramble the bits so consecutive outputs look independent.
-    /// Units: none (raw bits).
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A uniform random number in the half-open interval [0, 1).
-    ///
-    /// What: a fractional random value.
-    /// How/why: take the top 53 bits (the mantissa width of `f64`) and divide by
-    /// 2⁵³, giving an evenly spaced value in [0, 1).
-    /// Units: dimensionless.
-    fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// A standard-normal random number (mean 0, standard deviation 1).
-    ///
-    /// What: a bell-curve-distributed value, used for the band's latitude.
-    /// How/why: the Box–Muller transform turns two uniforms `u₁, u₂` into a normal
-    /// value `√(−2·ln u₁)·cos(2π·u₂)`.
-    /// Principle: Box–Muller maps a uniform square onto a Gaussian via polar form.
-    /// Units: dimensionless (multiply by σ for a chosen spread).
-    fn gaussian(&mut self) -> f64 {
-        let u1 = self.unit().max(1e-12); // avoid ln(0)
-        let u2 = self.unit();
-        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    }
-}
 
 #[cfg(test)]
 mod tests {

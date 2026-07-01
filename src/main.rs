@@ -27,6 +27,7 @@ mod config;
 mod edu;
 mod noise;
 mod physics;
+mod rng;
 mod render;
 mod stars;
 mod ui;
