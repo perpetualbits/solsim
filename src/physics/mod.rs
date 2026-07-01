@@ -7,6 +7,7 @@
 
 pub mod energy;
 pub mod forces;
+pub mod galactic;
 pub mod galaxy_ic;
 pub mod gpu;
 pub mod nbody;
