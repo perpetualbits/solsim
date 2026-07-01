@@ -188,6 +188,208 @@ pub fn compute_morton_gpu(
     out
 }
 
+/// The WGSL bitonic compare-exchange kernel (one thread per element).
+///
+/// Sorts by the pair `(key, val)` lexicographically, so equal Morton codes are
+/// ordered by particle index — exactly the total order the LBVH build needs.
+const BITONIC_SHADER: &str = r#"
+struct P { j: u32, k: u32, n: u32, _pad: u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> vals: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    let partner = i ^ p.j;
+    if (partner <= i) { return; }              // let the lower index do the work
+    let ascending = (i & p.k) == 0u;           // direction of this bitonic block
+    let ki = keys[i]; let kp = keys[partner];
+    let vi = vals[i]; let vp = vals[partner];
+    // Lexicographic (key, val) comparison.
+    let a_gt = (ki > kp) || (ki == kp && vi > vp);
+    let a_lt = (ki < kp) || (ki == kp && vi < vp);
+    let do_swap = select(a_lt, a_gt, ascending);
+    if (do_swap) {
+        keys[i] = kp; keys[partner] = ki;
+        vals[i] = vp; vals[partner] = vi;
+    }
+}
+"#;
+
+/// Sort `(keys, vals)` pairs on the GPU by `(key, val)` and read them back.
+///
+/// What: returns the pairs sorted ascending by key, ties broken by val.
+/// How/why: a **bitonic sorting network**. We pad the array up to a power of two
+/// with `0xFFFFFFFF` sentinels (which sort to the end), then run the fixed sequence
+/// of compare-exchange sub-passes: for block size `k = 2,4,…,M` and stride
+/// `j = k/2,…,1`, every element `i` compares with `i ^ j` and swaps to make its
+/// block bitonic, ascending or descending per `(i & k)`. Each sub-pass is one
+/// compute dispatch; the parameters `(j, k)` are fed through a uniform buffer with a
+/// dynamic offset, so the whole sort is a single command submission. The order is
+/// data-independent, so it is fully deterministic.
+/// Principle: a bitonic network sorts any input in `O(N·log²N)` compare-exchanges,
+/// all independent within a sub-pass — ideal for the GPU.
+/// Units: none.
+pub fn bitonic_sort_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    keys: &[u32],
+    vals: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let n = keys.len();
+    assert_eq!(n, vals.len());
+    if n <= 1 {
+        return (keys.to_vec(), vals.to_vec());
+    }
+    let m = n.next_power_of_two();
+
+    // Pad up to M with sentinels that sort to the very end.
+    let mut kpad = keys.to_vec();
+    let mut vpad = vals.to_vec();
+    kpad.resize(m, u32::MAX);
+    vpad.resize(m, u32::MAX);
+
+    let key_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sort keys"),
+        contents: bytemuck::cast_slice(&kpad),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let val_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sort vals"),
+        contents: bytemuck::cast_slice(&vpad),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+
+    // Build the (j, k) schedule and pack one 256-byte-aligned uniform block each,
+    // so we can select the current sub-pass with a dynamic offset.
+    const STRIDE: usize = 256; // safe uniform dynamic-offset alignment
+    let mut schedule: Vec<(u32, u32)> = Vec::new();
+    let mut k = 2usize;
+    while k <= m {
+        let mut j = k / 2;
+        while j >= 1 {
+            schedule.push((j as u32, k as u32));
+            j /= 2;
+        }
+        k *= 2;
+    }
+    let mut params = vec![0u8; schedule.len() * STRIDE];
+    for (idx, &(j, k)) in schedule.iter().enumerate() {
+        let base = idx * STRIDE;
+        params[base..base + 4].copy_from_slice(&j.to_le_bytes());
+        params[base + 4..base + 8].copy_from_slice(&k.to_le_bytes());
+        params[base + 8..base + 12].copy_from_slice(&(m as u32).to_le_bytes());
+    }
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sort params"),
+        contents: &params,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bitonic"),
+        source: wgpu::ShaderSource::Wgsl(BITONIC_SHADER.into()),
+    });
+    let mut ulayout = uniform_entry(0);
+    ulayout.ty = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Uniform,
+        has_dynamic_offset: true,
+        min_binding_size: std::num::NonZeroU64::new(16),
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sort layout"),
+        entries: &[ulayout, storage_entry(1, false), storage_entry(2, false)],
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sort bind"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &params_buf,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(16),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: key_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: val_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sort pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("bitonic pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let groups = (m as u32).div_ceil(64);
+    // One compute pass per sub-pass, so each fully finishes (and its writes are
+    // visible) before the next reads the buffers.
+    for idx in 0..schedule.len() {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bitonic pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[(idx * STRIDE) as u32]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    // Read back only the first N (the sorted real entries; padding is at the end).
+    let n_bytes = (n * 4) as u64;
+    let kback = readback_buffer(device, n_bytes);
+    let vback = readback_buffer(device, n_bytes);
+    encoder.copy_buffer_to_buffer(&key_buf, 0, &kback, 0, n_bytes);
+    encoder.copy_buffer_to_buffer(&val_buf, 0, &vback, 0, n_bytes);
+    queue.submit(Some(encoder.finish()));
+
+    let sorted_keys = map_u32(device, &kback, n);
+    let sorted_vals = map_u32(device, &vback, n);
+    (sorted_keys, sorted_vals)
+}
+
+/// A `MAP_READ` buffer of `bytes` bytes.
+fn readback_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Map a readback buffer and copy out `n` `u32`s (blocks until the GPU is done).
+fn map_u32(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<u32> {
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .unwrap();
+    let data = slice.get_mapped_range();
+    bytemuck::cast_slice::<u8, u32>(&data)[..n].to_vec()
+}
+
 /// A uniform-buffer bind-group-layout entry for the compute stage.
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -282,6 +484,31 @@ mod tests {
 
         assert_eq!(cpu.len(), gpu.len());
         assert_eq!(cpu, gpu, "GPU Morton codes differ from the CPU reference");
+    }
+
+    /// The GPU bitonic sort must match a plain CPU sort by `(key, index)`.
+    ///
+    /// Keys are drawn from a small range to force many ties, so this also checks
+    /// that equal keys end up ordered by index (what the tree build relies on).
+    #[test]
+    fn gpu_sort_matches_cpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0xFEED_FACE_C0DE_1234);
+        let n = 5000; // not a power of two, to exercise padding
+        let keys: Vec<u32> = (0..n).map(|_| (rng.unit() * 1000.0) as u32).collect();
+        let vals: Vec<u32> = (0..n as u32).collect();
+
+        let mut pairs: Vec<(u32, u32)> = keys.iter().copied().zip(vals.iter().copied()).collect();
+        pairs.sort(); // lexicographic (key, then index)
+        let ck: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        let cv: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+
+        let (gk, gv) = bitonic_sort_gpu(&device, &queue, &keys, &vals);
+        assert_eq!(ck, gk, "sorted keys differ from CPU");
+        assert_eq!(cv, gv, "sorted order (payload) differs from CPU");
     }
 
     use wgpu::util::DeviceExt;
