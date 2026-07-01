@@ -9,3 +9,4 @@ pub mod energy;
 pub mod forces;
 pub mod nbody;
 pub mod octree;
+pub mod particles;
