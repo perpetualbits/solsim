@@ -13,9 +13,11 @@
 use crate::physics::galaxy_ic::{colliding_pair, GalaxyParams};
 use crate::physics::gpu::GpuNBody;
 
-/// Disk particles per galaxy. Raise toward 50 000 for the 100k-body target (it
-/// runs slower per step); 30 000 keeps the collision smooth to watch.
-const N_DISK: usize = 30_000;
+/// Disk particles per galaxy → ~200k bodies total, a smooth default on a mid-range
+/// GPU with the full GPU pipeline (radix sort + cooperative walk). Push it higher for
+/// spectacle: ~250k/disk (500k total) still runs ~20–25 fps, a million is ~10 fps —
+/// widen θ with `]` to claw some back.
+const N_DISK: usize = 100_000;
 /// Simulation time advanced per step (leapfrog is stable at this size).
 const DT: f32 = 0.05;
 /// Most simulation steps we will run in a single frame (the fast-forward cap).

@@ -516,11 +516,31 @@ just added work while the bottleneck (bytes pulled through the cache per node) s
 put. We had already squeezed the bytes (§10), and the masses are too small to survive
 `f16`, so the walk is genuinely close to this laptop GPU's bandwidth floor.
 
-**So the honest ceiling on this hardware (an RTX A500 laptop GPU):** ~250–300k bodies
-at 60 fps, ~500k around 30, and a million at roughly 10 fps (θ = 1.0) — bandwidth,
-not cleverness, is the limit there. The remaining compute win is a radix sort (the
-bitonic sort is ~30 ms at a million; an O(N) sort would be a few), which most helps the
-250k–500k range where the framerate is already comfortable.
+**Radix sort — trading the O(N·log²N) network for O(N).** With the walk near its
+floor, the sort became the next-biggest slice, so we replaced the bitonic network with
+a **least-significant-digit radix sort** (`radix_sort_gpu`, and the resident
+`RADIX_*_SHADER` kernels). It sorts one 8-bit digit at a time — four passes cover a
+32-bit key — and each pass is a stable counting sort: **histogram** each 256-key tile,
+**scan** the per-tile histograms into an output offset for every (tile, digit), then
+**scatter** each key to its slot. "Stable" (equal digits keep their order) is what
+makes LSD radix converge, and it hands us a bonus: since the input order is the
+particle index, equal Morton codes come out in index order — exactly the `(code,
+index)` order the tree build wanted, for free. At a million keys it is ~16 ms in the
+pipeline versus ~31 for bitonic — the sort roughly halved, and it scales O(N) rather
+than O(N·log²N), so it only gets better as N grows. It is validated the same way as
+everything else: a headless test sorts against Rust's own `sort()`, ties included.
+
+**So the honest ceiling on this hardware (an RTX A500 laptop GPU), with everything in:**
+
+| bodies | full force step (θ = 0.8) | ≈ fps |
+|-------:|--------------------------:|------:|
+| 200 000 (the default) | ~24 ms | ~40 |
+| 500 000 | ~57 ms | ~18 (θ = 1.0: ~24) |
+| 1 000 000 | ~121 ms | ~8 (θ = 1.0: ~12) |
+
+Bandwidth in the tree walk, not cleverness, is the limit at the top end. The default
+galaxy is **~200k bodies** — a smooth ~40 fps that stays watchable through the
+collision — and `[` / `]` trade accuracy for speed if you push the count higher.
 
 ---
 

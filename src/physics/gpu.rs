@@ -370,6 +370,268 @@ pub fn bitonic_sort_gpu(
     (sorted_keys, sorted_vals)
 }
 
+// ---------------------------------------------------------------------------
+// Radix sort — an O(N) alternative to the bitonic network for big arrays.
+// ---------------------------------------------------------------------------
+//
+// The bitonic sort is O(N·log²N): at a million keys that is ~210 passes. A least-
+// significant-digit **radix sort** is O(N): sort by the low 8 bits, then the next 8,
+// and so on — four passes cover a 32-bit key. Each pass is a stable counting sort of
+// one 8-bit digit, done in three steps: count each tile's digits (histogram), work
+// out where every tile's digits land in the output (scan), and move the elements
+// (scatter). "Stable" means equal digits keep their order, which is what makes LSD
+// radix end up fully sorted — and, because our input order is the particle index,
+// equal Morton codes come out in index order, exactly the `(code, index)` order the
+// tree build needs.
+
+/// One 256-bin histogram per tile of `WG` consecutive keys (digit = 8 bits at `shift`).
+const RADIX_HIST_SHADER: &str = r#"
+struct U { n: u32, num_tiles: u32, shift: u32, _p: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> keys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> tile_hist: array<u32>;
+var<workgroup> h: array<atomic<u32>, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    atomicStore(&h[lid], 0u);
+    workgroupBarrier();
+    let i = wid.x * 256u + lid;
+    if (i < u.n) {
+        let d = (keys[i] >> u.shift) & 255u;
+        atomicAdd(&h[d], 1u);
+    }
+    workgroupBarrier();
+    // Store this tile's counts, laid out digit-major so the scan can stride tiles.
+    tile_hist[wid.x * 256u + lid] = atomicLoad(&h[lid]);
+}
+"#;
+
+/// Turn the per-tile histograms into the output offset of every (tile, digit).
+///
+/// One workgroup, one thread per digit `b`. Thread `b` sums its column to get the
+/// digit's global total, thread 0 exclusive-scans those totals to get each digit's
+/// base, then thread `b` walks the tiles writing each tile's start = base + running.
+const RADIX_SCAN_SHADER: &str = r#"
+struct U { n: u32, num_tiles: u32, shift: u32, _p: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> tile_hist: array<u32>;
+@group(0) @binding(2) var<storage, read_write> tile_offset: array<u32>;
+var<workgroup> total: array<u32, 256>;
+var<workgroup> base: array<u32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) b: u32) {
+    var s = 0u;
+    for (var t = 0u; t < u.num_tiles; t = t + 1u) {
+        s = s + tile_hist[t * 256u + b];
+    }
+    total[b] = s;
+    workgroupBarrier();
+    if (b == 0u) {
+        var run = 0u;
+        for (var d = 0u; d < 256u; d = d + 1u) {
+            base[d] = run;
+            run = run + total[d];
+        }
+    }
+    workgroupBarrier();
+    var run = base[b];
+    for (var t = 0u; t < u.num_tiles; t = t + 1u) {
+        tile_offset[t * 256u + b] = run;
+        run = run + tile_hist[t * 256u + b];
+    }
+}
+"#;
+
+/// Scatter each key/value to its sorted position (stable within a tile).
+///
+/// A tile's earlier elements are always valid (indices are contiguous), so an
+/// element's rank is just how many earlier threads in the tile share its digit —
+/// counted directly. Its output slot is that tile-and-digit's offset plus the rank.
+const RADIX_SCATTER_SHADER: &str = r#"
+struct U { n: u32, num_tiles: u32, shift: u32, _p: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> keys_in: array<u32>;
+@group(0) @binding(2) var<storage, read> vals_in: array<u32>;
+@group(0) @binding(3) var<storage, read> tile_offset: array<u32>;
+@group(0) @binding(4) var<storage, read_write> keys_out: array<u32>;
+@group(0) @binding(5) var<storage, read_write> vals_out: array<u32>;
+var<workgroup> sd: array<u32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let tile = wid.x;
+    let i = tile * 256u + lid;
+    let valid = i < u.n;
+    var key = 0u;
+    var val = 0u;
+    var d = 256u;                    // sentinel digit for out-of-range lanes
+    if (valid) {
+        key = keys_in[i];
+        val = vals_in[i];
+        d = (key >> u.shift) & 255u;
+    }
+    sd[lid] = d;
+    workgroupBarrier();
+    if (valid) {
+        var rank = 0u;
+        for (var j = 0u; j < lid; j = j + 1u) {
+            if (sd[j] == d) { rank = rank + 1u; }
+        }
+        let pos = tile_offset[tile * 256u + d] + rank;
+        keys_out[pos] = key;
+        vals_out[pos] = val;
+    }
+}
+"#;
+
+/// Sort `(keys, vals)` by key with a stable 4-pass LSD radix sort, on the GPU.
+///
+/// What: returns the pairs sorted ascending by key; equal keys keep input order (so
+/// with `vals = 0,1,2,…` the result is `(key, index)` order — what the tree needs).
+/// How/why: four passes over 8-bit digits, each a stable counting sort
+/// (histogram → scan → scatter). O(N) work per pass, four passes for a 32-bit key —
+/// far fewer than the bitonic network's ~log²N passes once N is large.
+/// Units: none.
+pub fn radix_sort_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    keys: &[u32],
+    vals: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let n = keys.len();
+    assert_eq!(n, vals.len());
+    if n <= 1 {
+        return (keys.to_vec(), vals.to_vec());
+    }
+    let num_tiles = n.div_ceil(256);
+
+    let rw = |bytes: u64, label| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let key_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("radix key a"),
+        contents: bytemuck::cast_slice(keys),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let val_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("radix val a"),
+        contents: bytemuck::cast_slice(vals),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let key_b = rw((n * 4) as u64, "radix key b");
+    let val_b = rw((n * 4) as u64, "radix val b");
+    let tile_hist = rw((num_tiles * 256 * 4) as u64, "radix tile hist");
+    let tile_offset = rw((num_tiles * 256 * 4) as u64, "radix tile offset");
+
+    // One uniform per pass (they differ only in the digit shift).
+    let uni: Vec<wgpu::Buffer> = (0..4)
+        .map(|p| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("radix uni"),
+                contents: bytemuck::cast_slice(&[n as u32, num_tiles as u32, (p * 8) as u32, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        })
+        .collect();
+
+    let module = |src| {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("radix"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+        })
+    };
+    let pipe = |shader: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout| {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("radix pl"),
+            bind_group_layouts: &[Some(layout)],
+            immediate_size: 0,
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("radix pipe"),
+            layout: Some(&pl),
+            module: shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let hist_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("radix hist layout"),
+        entries: &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false)],
+    });
+    let scan_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("radix scan layout"),
+        entries: &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false)],
+    });
+    let scatter_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("radix scatter layout"),
+        entries: &[
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, false),
+            storage_entry(5, false),
+        ],
+    });
+    let hist_pipe = pipe(&module(RADIX_HIST_SHADER), &hist_layout);
+    let scan_pipe = pipe(&module(RADIX_SCAN_SHADER), &scan_layout);
+    let scatter_pipe = pipe(&module(RADIX_SCATTER_SHADER), &scatter_layout);
+
+    let bind = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
+            .collect();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("radix bind"),
+            layout,
+            entries: &entries,
+        })
+    };
+
+    let tiles = num_tiles as u32;
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("radix") });
+    for (p, uni_p) in uni.iter().enumerate() {
+        // Ping-pong: even passes A→B, odd passes B→A.
+        let (kin, vin, kout, vout) = if p % 2 == 0 {
+            (&key_a, &val_a, &key_b, &val_b)
+        } else {
+            (&key_b, &val_b, &key_a, &val_a)
+        };
+        let b_hist = bind(&hist_layout, &[uni_p, kin, &tile_hist]);
+        let b_scan = bind(&scan_layout, &[uni_p, &tile_hist, &tile_offset]);
+        let b_scatter = bind(&scatter_layout, &[uni_p, kin, vin, &tile_offset, kout, vout]);
+        let mut run = |pipe: &wgpu::ComputePipeline, bg: &wgpu::BindGroup, groups: u32| {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        };
+        run(&hist_pipe, &b_hist, tiles);
+        run(&scan_pipe, &b_scan, 1);
+        run(&scatter_pipe, &b_scatter, tiles);
+    }
+
+    // After four passes the result is back in A.
+    let n_bytes = (n * 4) as u64;
+    let kback = readback_buffer(device, n_bytes);
+    let vback = readback_buffer(device, n_bytes);
+    encoder.copy_buffer_to_buffer(&key_a, 0, &kback, 0, n_bytes);
+    encoder.copy_buffer_to_buffer(&val_a, 0, &vback, 0, n_bytes);
+    queue.submit(Some(encoder.finish()));
+    (map_u32(device, &kback, n), map_u32(device, &vback, n))
+}
+
 /// The WGSL LBVH structure kernel (Karras 2012): one thread per internal node.
 ///
 /// Node ids: internal nodes `0..n-1`, leaves `n-1..2n-1` (leaf `k` is id `n-1+k`);
@@ -1571,8 +1833,7 @@ pub struct GpuNBody {
     uni_sort: wgpu::Buffer,
     uni_trav: wgpu::Buffer,
     uni_integ: wgpu::Buffer,
-    bitonic_params: wgpu::Buffer,
-    bitonic_passes: usize,
+    num_tiles: u32,
     soft2: f32,
     g: f32,
     // Pipelines.
@@ -1581,7 +1842,9 @@ pub struct GpuNBody {
     p_bbox: wgpu::ComputePipeline,
     p_morton: wgpu::ComputePipeline,
     p_setup: wgpu::ComputePipeline,
-    p_bitonic: wgpu::ComputePipeline,
+    p_rhist: wgpu::ComputePipeline,
+    p_rscan: wgpu::ComputePipeline,
+    p_rscatter: wgpu::ComputePipeline,
     p_gather: wgpu::ComputePipeline,
     p_seed: wgpu::ComputePipeline,
     p_lbvh: wgpu::ComputePipeline,
@@ -1595,7 +1858,9 @@ pub struct GpuNBody {
     b_bbox: wgpu::BindGroup,
     b_morton: wgpu::BindGroup,
     b_setup: wgpu::BindGroup,
-    b_bitonic: wgpu::BindGroup,
+    b_rhist: [wgpu::BindGroup; 4],
+    b_rscan: [wgpu::BindGroup; 4],
+    b_rscatter: [wgpu::BindGroup; 4],
     b_gather: wgpu::BindGroup,
     b_seed: wgpu::BindGroup,
     b_lbvh: wgpu::BindGroup,
@@ -1681,6 +1946,22 @@ impl GpuNBody {
         let done_a = zeros((total * 4) as u64, storage, "done a");
         let done_b = zeros((total * 4) as u64, storage, "done b");
         let acc_sorted = zeros((n * 16) as u64, storage, "acc sorted");
+        // Radix-sort scratch: a second key/val buffer to ping-pong into, plus the
+        // per-tile histogram and offset matrices.
+        let num_tiles = n.div_ceil(256);
+        let key_b = zeros((m * 4) as u64, storage, "radix key b");
+        let val_b = zeros((m * 4) as u64, storage, "radix val b");
+        let tile_hist = zeros((num_tiles * 256 * 4) as u64, storage, "radix tile hist");
+        let tile_offset = zeros((num_tiles * 256 * 4) as u64, storage, "radix tile offset");
+        let radix_uni: Vec<wgpu::Buffer> = (0..4)
+            .map(|p| {
+                init(
+                    bytemuck::cast_slice(&[n as u32, num_tiles as u32, (p * 8) as u32, 0u32]),
+                    wgpu::BufferUsages::UNIFORM,
+                    "radix uni",
+                )
+            })
+            .collect();
         let pos_readback = readback_buffer(device, (n * 16) as u64);
 
         // --- uniforms ---
@@ -1697,29 +1978,6 @@ impl GpuNBody {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             "uni integ",
         );
-
-        // Bitonic schedule packed as 256-byte-aligned uniform blocks with a dynamic
-        // offset per sub-pass (identical to `bitonic_sort_gpu`).
-        const STRIDE: usize = 256;
-        let mut schedule: Vec<(u32, u32)> = Vec::new();
-        let mut kk = 2usize;
-        while kk <= m {
-            let mut j = kk / 2;
-            while j >= 1 {
-                schedule.push((j as u32, kk as u32));
-                j /= 2;
-            }
-            kk *= 2;
-        }
-        let mut params = vec![0u8; schedule.len().max(1) * STRIDE];
-        for (idx, &(j, k)) in schedule.iter().enumerate() {
-            let base = idx * STRIDE;
-            params[base..base + 4].copy_from_slice(&j.to_le_bytes());
-            params[base + 4..base + 8].copy_from_slice(&k.to_le_bytes());
-            params[base + 8..base + 12].copy_from_slice(&(m as u32).to_le_bytes());
-        }
-        let bitonic_params =
-            init(&params, wgpu::BufferUsages::UNIFORM, "bitonic params");
 
         // --- pipelines + bind groups ---
         let mk = |src, entries: &[wgpu::BindGroupLayoutEntry], label: &str| {
@@ -1803,53 +2061,51 @@ impl GpuNBody {
         );
         let b_setup = bind(&l_setup, &[&uni_sort, &codes, &keys, &vals], "setup");
 
-        // Bitonic reuses the shared shader but with a dynamic-offset uniform.
-        let (p_bitonic, b_bitonic) = {
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("bitonic"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BITONIC_SHADER)),
-            });
-            let mut ulayout = uniform_entry(0);
-            ulayout.ty = wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: std::num::NonZeroU64::new(16),
-            };
-            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("bitonic"),
-                entries: &[ulayout, storage_entry(1, false), storage_entry(2, false)],
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("bitonic"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("bitonic"),
-                layout: Some(&pl),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bitonic"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &bitonic_params,
-                            offset: 0,
-                            size: std::num::NonZeroU64::new(16),
-                        }),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: keys.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: vals.as_entire_binding() },
-                ],
-            });
-            (pipe, bg)
+        // Radix sort: three kernels (histogram, scan, scatter), four digit passes.
+        let (p_rhist, l_rhist) = mk(
+            RADIX_HIST_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false)],
+            "rhist",
+        );
+        let (p_rscan, l_rscan) = mk(
+            RADIX_SCAN_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false)],
+            "rscan",
+        );
+        let (p_rscatter, l_rscatter) = mk(
+            RADIX_SCATTER_SHADER,
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, false),
+                storage_entry(5, false),
+            ],
+            "rscatter",
+        );
+        // Per-pass bind groups. Even passes sort keys/vals → key_b/val_b; odd the other
+        // way, so after four passes the result is back in keys/vals.
+        let mk4 = |f: &dyn Fn(usize) -> wgpu::BindGroup| {
+            [f(0), f(1), f(2), f(3)]
         };
+        let b_rhist = mk4(&|p| {
+            let kin = if p % 2 == 0 { &keys } else { &key_b };
+            bind(&l_rhist, &[&radix_uni[p], kin, &tile_hist], "rhist")
+        });
+        let b_rscan = mk4(&|p| bind(&l_rscan, &[&radix_uni[p], &tile_hist, &tile_offset], "rscan"));
+        let b_rscatter = mk4(&|p| {
+            let (kin, vin, kout, vout) = if p % 2 == 0 {
+                (&keys, &vals, &key_b, &val_b)
+            } else {
+                (&key_b, &val_b, &keys, &vals)
+            };
+            bind(
+                &l_rscatter,
+                &[&radix_uni[p], kin, vin, &tile_offset, kout, vout],
+                "rscatter",
+            )
+        });
 
         let (p_gather, l_gather) = mk(
             GATHER_SHADER,
@@ -1978,8 +2234,7 @@ impl GpuNBody {
             uni_sort,
             uni_trav,
             uni_integ,
-            bitonic_params,
-            bitonic_passes: schedule.len(),
+            num_tiles: num_tiles as u32,
             soft2: softening * softening,
             g,
             p_pre,
@@ -1987,7 +2242,9 @@ impl GpuNBody {
             p_bbox,
             p_morton,
             p_setup,
-            p_bitonic,
+            p_rhist,
+            p_rscan,
+            p_rscatter,
             p_gather,
             p_seed,
             p_lbvh,
@@ -2000,7 +2257,9 @@ impl GpuNBody {
             b_bbox,
             b_morton,
             b_setup,
-            b_bitonic,
+            b_rhist,
+            b_rscan,
+            b_rscatter,
             b_gather,
             b_seed,
             b_lbvh,
@@ -2044,12 +2303,15 @@ impl GpuNBody {
             p.set_bind_group(0, bg, offset);
             p.dispatch_workgroups(groups, 1, 1);
         }
+        let tiles = self.num_tiles;
         one(enc, &self.p_bbox, &self.b_bbox, &[], 1); // single-workgroup reduction
         one(enc, &self.p_morton, &self.b_morton, &[], gn);
         one(enc, &self.p_setup, &self.b_setup, &[], gm);
-        // Bitonic: one pass per sub-pass, selecting its (j,k) by dynamic offset.
-        for idx in 0..self.bitonic_passes {
-            one(enc, &self.p_bitonic, &self.b_bitonic, &[(idx * 256) as u32], gm);
+        // Radix sort: for each of four 8-bit digits, histogram → scan → scatter.
+        for p in 0..4usize {
+            one(enc, &self.p_rhist, &self.b_rhist[p], &[], tiles);
+            one(enc, &self.p_rscan, &self.b_rscan[p], &[], 1);
+            one(enc, &self.p_rscatter, &self.b_rscatter[p], &[], tiles);
         }
         one(enc, &self.p_gather, &self.b_gather, &[], gn);
         one(enc, &self.p_seed, &self.b_seed, &[], gtot);
@@ -2221,9 +2483,11 @@ impl GpuNBody {
         out.push(bench("bbox", &mut |e| one(e, &self.p_bbox, &self.b_bbox, &[], 1)));
         out.push(bench("morton", &mut |e| one(e, &self.p_morton, &self.b_morton, &[], gn)));
         out.push(bench("sort-setup", &mut |e| one(e, &self.p_setup, &self.b_setup, &[], gm)));
-        out.push(bench("bitonic-sort", &mut |e| {
-            for idx in 0..self.bitonic_passes {
-                one(e, &self.p_bitonic, &self.b_bitonic, &[(idx * 256) as u32], gm);
+        out.push(bench("radix-sort", &mut |e| {
+            for p in 0..4usize {
+                one(e, &self.p_rhist, &self.b_rhist[p], &[], self.num_tiles);
+                one(e, &self.p_rscan, &self.b_rscan[p], &[], 1);
+                one(e, &self.p_rscatter, &self.b_rscatter[p], &[], self.num_tiles);
             }
         }));
         out.push(bench("gather", &mut |e| one(e, &self.p_gather, &self.b_gather, &[], gn)));
@@ -2307,6 +2571,63 @@ mod tests {
         let (gk, gv) = bitonic_sort_gpu(&device, &queue, &keys, &vals);
         assert_eq!(ck, gk, "sorted keys differ from CPU");
         assert_eq!(cv, gv, "sorted order (payload) differs from CPU");
+    }
+
+    /// Time radix vs bitonic at a million keys. Ignored; run with
+    /// `cargo test --release profile_sorts -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn profile_sorts() {
+        use std::time::Instant;
+        let Some((device, queue)) = headless_device() else {
+            return;
+        };
+        let mut rng = Rng::new(0x1122_3344_5566_7788);
+        let n = 1_000_000usize;
+        let keys: Vec<u32> = (0..n).map(|_| (rng.unit() * 1.07e9) as u32).collect();
+        let vals: Vec<u32> = (0..n as u32).collect();
+        let bench = |name: &str, f: &dyn Fn()| {
+            f();
+            f();
+            let t0 = Instant::now();
+            let iters = 10;
+            for _ in 0..iters {
+                f();
+            }
+            println!("{name}: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
+        };
+        bench("bitonic", &|| {
+            bitonic_sort_gpu(&device, &queue, &keys, &vals);
+        });
+        bench("radix", &|| {
+            radix_sort_gpu(&device, &queue, &keys, &vals);
+        });
+    }
+
+    /// The GPU radix sort must match a plain CPU sort by `(key, index)`.
+    ///
+    /// Keys are drawn from a small range to force many ties, so this checks the sort
+    /// is **stable** (equal keys keep index order) — exactly what the tree relies on.
+    /// `n` is not a multiple of the 256-tile size, exercising the ragged last tile.
+    #[test]
+    fn gpu_radix_matches_cpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x5A17_C0DE_9911_2244);
+        let n = 70_003; // not a multiple of 256
+        let keys: Vec<u32> = (0..n).map(|_| (rng.unit() * 4000.0) as u32).collect();
+        let vals: Vec<u32> = (0..n as u32).collect();
+
+        let mut pairs: Vec<(u32, u32)> = keys.iter().copied().zip(vals.iter().copied()).collect();
+        pairs.sort();
+        let ck: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        let cv: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+
+        let (gk, gv) = radix_sort_gpu(&device, &queue, &keys, &vals);
+        assert_eq!(ck, gk, "radix sorted keys differ from CPU");
+        assert_eq!(cv, gv, "radix sorted order (payload) differs from CPU");
     }
 
     /// The GPU LBVH must be a correct binary radix tree over the sorted codes.
