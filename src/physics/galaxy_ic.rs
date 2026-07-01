@@ -145,10 +145,78 @@ pub fn colliding_pair(
     (pos, vel, mass)
 }
 
+/// A Milky-Way-and-Andromeda-like colliding pair in **physical units**, with a "Sun"
+/// tracer tagged in the first galaxy — the initial state for the research mode.
+///
+/// What: returns `(positions, velocities, masses, sun_index)` in galactic units
+/// (kpc, kpc/Myr, 10¹⁰ M☉), where `sun_index` is a disk star of galaxy A riding at
+/// ~8 kpc — a stand-in for the Sun whose neighbourhood we watch during the collision.
+/// How/why: two exponential disks with heavy centres (a bulge-plus-inner-halo proxy)
+/// are tuned so a star at 8 kpc circles at the Sun's real ~220 km/s, then set on a
+/// grazing approach. To keep the demo watchable we start them ~120 kpc apart closing
+/// at ~150 km/s (the real pair is ~780 kpc and ~4.5 Gyr from first passage — the
+/// physics of the passage is the same, we just skip the long coast). The Sun is the
+/// disk particle of galaxy A whose radius is nearest 8 kpc.
+/// Principle: a two-galaxy encounter in real units, so tides and densities read out in
+/// numbers you can compare to the literature.
+/// Units: kpc, kpc/Myr, 10¹⁰ M☉.
+pub fn physical_pair(n_disk: usize, g: f32, seed: u64) -> (Vec<Vec3>, Vec<Vec3>, Vec<f32>, usize) {
+    // Milky-Way-like: enclosed mass ~9×10¹⁰ M☉ inside 8 kpc → v_c ≈ 226 km/s there.
+    let mw = GalaxyParams {
+        n_disk,
+        central_mass: 5.0, // bulge + inner-halo proxy, 5×10¹⁰ M☉
+        disk_mass: 5.0,
+        scale_radius: 3.0, // kpc
+        thickness: 0.3,    // kpc disk scale height
+        spin: 1.0,
+    };
+    // Andromeda-like: a bit heavier and larger.
+    let m31 = GalaxyParams {
+        n_disk,
+        central_mass: 7.0,
+        disk_mass: 7.0,
+        scale_radius: 4.0,
+        thickness: 0.3,
+        spin: 1.0,
+    };
+    // separation 120 kpc, approach 0.15 kpc/Myr (~147 km/s), impact 30 kpc, tilt ~0.5 rad.
+    let (pos, vel, mass) = colliding_pair(&mw, &m31, g, 120.0, 0.15, 30.0, 0.5, seed);
+
+    // Tag the Sun: the galaxy-A disk star closest to 8 kpc from A's centre (particle 0).
+    let centre = pos[0];
+    let mut sun_index = 1;
+    let mut best = f32::INFINITY;
+    for (k, p) in pos[1..=n_disk].iter().enumerate() {
+        let d = ((*p - centre).length() - 8.0).abs();
+        if d < best {
+            best = d;
+            sun_index = k + 1;
+        }
+    }
+    (pos, vel, mass, sun_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physics::galactic::{circular_speed, G_GAL, KMS_PER_KPC_MYR};
     use crate::physics::particles::Particles;
+
+    /// The physical pair must tag a Sun near 8 kpc, orbiting at roughly 220 km/s.
+    #[test]
+    fn physical_pair_places_a_sun_like_star() {
+        let g = G_GAL as f32;
+        let (pos, vel, _mass, sun) = physical_pair(5000, g, 2024);
+        // The Sun sits ~8 kpc from galaxy A's centre.
+        let r = (pos[sun] - pos[0]).length();
+        assert!((6.0..10.0).contains(&r), "Sun at {r} kpc, expected ~8");
+        // Its speed relative to galaxy A's centre is ~200–260 km/s.
+        let speed = ((vel[sun] - vel[0]).length() as f64) * KMS_PER_KPC_MYR;
+        assert!((160.0..300.0).contains(&speed), "Sun speed {speed} km/s off");
+        // Sanity: the circular-speed formula agrees at 8 kpc for ~9×10¹⁰ M☉ enclosed.
+        let v_ref = circular_speed(9.0, 8.0) * KMS_PER_KPC_MYR;
+        assert!((180.0..270.0).contains(&v_ref), "reference v_c {v_ref} km/s off");
+    }
 
     /// The circular-velocity recipe: a massless disk around a point mass must keep
     /// a constant orbital radius (a Keplerian circle).

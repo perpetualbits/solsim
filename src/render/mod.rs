@@ -196,8 +196,9 @@ impl Scene {
         queue: &wgpu::Queue,
         pos: Option<&wgpu::Buffer>,
         n_a: u32,
+        sun: u32,
     ) {
-        self.point_pass.bind_resident(device, queue, pos, n_a);
+        self.point_pass.bind_resident(device, queue, pos, n_a, sun);
     }
 
     /// Draw the whole scene for one frame.

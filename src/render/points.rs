@@ -95,7 +95,7 @@ struct Globals {
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
-struct Cloud { n_a: u32, _a: u32, _b: u32, _c: u32 };
+struct Cloud { n_a: u32, sun: u32, _b: u32, _c: u32 };
 @group(1) @binding(0) var<uniform> c: Cloud;
 @group(1) @binding(1) var<storage, read> pos: array<vec4<f32>>;
 
@@ -124,6 +124,10 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
         size = 8.0;
     } else if (ii >= c.n_a) {
         color = vec4<f32>(1.0, 0.7, 0.42, 0.62);    // galaxy B: warm
+    }
+    if (ii == c.sun) {
+        color = vec4<f32>(1.0, 1.0, 1.0, 1.0);      // the Sun tracer: bright white
+        size = 11.0;
     }
     out.color = color;
 
@@ -357,9 +361,10 @@ impl PointPass {
         queue: &wgpu::Queue,
         pos: Option<&wgpu::Buffer>,
         n_a: u32,
+        sun: u32,
     ) {
         self.resident_bind = pos.map(|pos| {
-            queue.write_buffer(&self.resident_params, 0, bytemuck::cast_slice(&[n_a, 0, 0, 0]));
+            queue.write_buffer(&self.resident_params, 0, bytemuck::cast_slice(&[n_a, sun, 0, 0]));
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("resident points bind"),
                 layout: &self.resident_layout,

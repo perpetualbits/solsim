@@ -1953,7 +1953,7 @@ impl GpuNBody {
             })
         };
         let pos_buf = init(bytemuck::cast_slice(&pos4), sc | wgpu::BufferUsages::COPY_DST, "pos");
-        let vel_buf = init(bytemuck::cast_slice(&vel4), storage, "vel");
+        let vel_buf = init(bytemuck::cast_slice(&vel4), sc, "vel"); // COPY_SRC: research probe
         let acc_buf = zeros((n * 16) as u64, storage, "acc");
         let mass_buf = init(bytemuck::cast_slice(mass), storage, "mass");
 
@@ -2454,6 +2454,23 @@ impl GpuNBody {
     /// Units: the caller's length.
     pub fn pos_buffer(&self) -> &wgpu::Buffer {
         &self.pos
+    }
+
+    /// Copy the velocities back to the CPU (for the research-mode environment probe).
+    ///
+    /// What: returns every particle's velocity, in the original order.
+    /// How/why: like [`positions`](Self::positions), one staged copy of the velocity
+    /// buffer — used only occasionally (every few steps) to measure the Sun's local
+    /// velocity spread, so a fresh staging buffer each call is fine.
+    /// Units: the caller's speed (kpc/Myr in the research mode).
+    pub fn velocities(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<Vec3> {
+        let back = readback_buffer(device, (self.n * 16) as u64);
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("vel readback") });
+        enc.copy_buffer_to_buffer(&self.vel, 0, &back, 0, (self.n * 16) as u64);
+        queue.submit(Some(enc.finish()));
+        let flat = map_f32(device, &back, self.n * 4);
+        flat.chunks_exact(4).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
     }
 
     /// Number of particles.

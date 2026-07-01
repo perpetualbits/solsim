@@ -1450,6 +1450,52 @@ impl App {
 
     /// Draw one frame of the colliding-galaxies mode.
     ///
+    /// Draw the research time-series: each quantity as a multiple of its quiet value.
+    ///
+    /// What: a small multi-line plot of the Sun's tidal field, local density, and
+    /// comet-shower rate over time, each divided by its starting (quiet-galaxy) value.
+    /// How/why: dividing by the baseline puts all three on one axis starting at 1, so a
+    /// rise above the faint "1×" line is exactly "worse than a quiet galaxy". The y-axis
+    /// is logarithmic because the spikes can be large.
+    /// Units: x is Myr, y is dimensionless (a ratio).
+    fn plot_research(ui: &mut egui::Ui, series: &[[f32; 4]]) {
+        let size = egui::vec2(ui.available_width().min(280.0), 90.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
+        if series.len() < 2 {
+            return;
+        }
+        let t0 = series[0][0];
+        let t1 = series[series.len() - 1][0];
+        let mut ymax = 2.0f32;
+        for s in series {
+            ymax = ymax.max(s[1]).max(s[2]).max(s[3]);
+        }
+        let ylog = |r: f32| r.max(0.3).ln();
+        let (lo, hi) = (ylog(0.5), ylog(ymax));
+        let map = |t: f32, r: f32| {
+            let fx = (t - t0) / (t1 - t0).max(1e-6);
+            let fy = (ylog(r) - lo) / (hi - lo).max(1e-6);
+            egui::pos2(rect.left() + fx * rect.width(), rect.bottom() - fy * rect.height())
+        };
+        // Faint reference line at "1× quiet".
+        let y1 = map(t0, 1.0).y;
+        painter.line_segment(
+            [egui::pos2(rect.left(), y1), egui::pos2(rect.right(), y1)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        );
+        let colors = [
+            egui::Color32::from_rgb(120, 170, 255), // tide
+            egui::Color32::from_rgb(120, 220, 120), // density
+            egui::Color32::from_rgb(240, 120, 120), // comet showers
+        ];
+        for (k, &color) in colors.iter().enumerate() {
+            let pts: Vec<egui::Pos2> = series.iter().map(|s| map(s[0], s[1 + k])).collect();
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
+        }
+    }
+
     /// What: steps the galaxy simulation and renders it as a point cloud, in place
     /// of the solar-system scene.
     /// How/why: advance the sim and colour the particles, then reuse the shared
@@ -1470,6 +1516,30 @@ impl App {
         let n = gm.len();
         let steps = gm.steps_per_frame();
         let theta = gm.theta();
+        // Research read-outs: the current vs baseline environment, and a downsampled
+        // time series of each quantity as a multiple of its quiet-galaxy value.
+        let research = if gm.is_research() {
+            gm.latest_and_baseline().map(|(last, base)| {
+                let hist = gm.history();
+                let stride = (hist.len() / 240).max(1);
+                let ratio = |x: f64, b: f64| (x / b.max(1e-30)) as f32;
+                let series: Vec<[f32; 4]> = hist
+                    .iter()
+                    .step_by(stride)
+                    .map(|s| {
+                        [
+                            s.time_myr as f32,
+                            ratio(s.env.tidal_strength, base.tidal_strength),
+                            ratio(s.env.density, base.density),
+                            ratio(s.env.encounter_rate, base.encounter_rate),
+                        ]
+                    })
+                    .collect();
+                (last, base, series)
+            })
+        } else {
+            None
+        };
         self.galaxy = Some(gm);
 
         let fps = self.fps;
@@ -1497,20 +1567,48 @@ impl App {
         let grid_fade = grid::fade_distances(view_scale);
 
         let raw_input = egui.state.take_egui_input(window);
+        let title = if research.is_some() {
+            "Sun's neighbourhood — galaxy collision"
+        } else {
+            "Colliding galaxies"
+        };
         let full_output = egui.ctx.run_ui(raw_input, |ctx_ui| {
-            egui::Window::new("Colliding galaxies")
+            egui::Window::new(title)
                 .resizable(false)
                 .show(ctx_ui.ctx(), |ui| {
                     ui.label(format!("Particles: {n}"));
-                    ui.label(format!("Sim time: {sim_time:.1}"));
-                    ui.label(format!("Speed: {steps}× steps/frame"));
-                    ui.label(format!("θ (accuracy): {theta:.1}"));
-                    ui.label(format!("FPS: {fps:.0}"));
-                    ui.separator();
-                    ui.label("Drag — orbit    Wheel — zoom");
-                    ui.label(".  /  ,  — faster / slower    C — grid");
-                    ui.label("[  /  ]  — finer / coarser gravity (θ)");
-                    ui.label("X — back to the solar system");
+                    if let Some((last, base, series)) = &research {
+                        // Physical research read-out.
+                        ui.label(format!("Time: {:.0} Myr", sim_time));
+                        ui.separator();
+                        let tide_x = last.tidal_strength / base.tidal_strength.max(1e-30);
+                        let enc_x = last.encounter_rate / base.encounter_rate.max(1e-30);
+                        ui.label(format!(
+                            "Local density: {:.3} M⊙/pc³",
+                            last.density * 1e10 / 1e9 // 10¹⁰M⊙/kpc³ → M⊙/pc³
+                        ));
+                        ui.label(format!("Star flyby speed: {:.0} km/s", last.dispersion_kms));
+                        ui.label(format!("Tidal field: {tide_x:.1}× the quiet value"));
+                        ui.label(format!(
+                            "Comet-shower rate: {:.2}/Myr  ({enc_x:.1}× quiet)",
+                            last.encounter_rate
+                        ));
+                        ui.separator();
+                        Self::plot_research(ui, series);
+                        ui.label("blue tide · green density · red comet showers (×quiet)");
+                        ui.separator();
+                        ui.label(".  /  ,  — fast-forward / slow    M — leave research");
+                    } else {
+                        ui.label(format!("Sim time: {sim_time:.1}"));
+                        ui.label(format!("Speed: {steps}× steps/frame"));
+                        ui.label(format!("θ (accuracy): {theta:.1}"));
+                        ui.label(format!("FPS: {fps:.0}"));
+                        ui.separator();
+                        ui.label("Drag — orbit    Wheel — zoom");
+                        ui.label(".  /  ,  — faster / slower    C — grid");
+                        ui.label("[  /  ]  — finer / coarser gravity (θ)");
+                        ui.label("X — back    M — research (Milky Way × Andromeda)");
+                    }
                 });
         });
         egui.state
@@ -1797,6 +1895,37 @@ impl ApplicationHandler for App {
                                 self.gr_strength = (self.gr_strength * 0.1).max(1.0e-3);
                             }
                         }
+                        // Research mode: physical Milky Way × Andromeda, tracking the
+                        // Sun's neighbourhood. Toggles like the visual galaxy (X).
+                        "m" => {
+                            if self.galaxy.is_some() {
+                                self.galaxy = None;
+                                if let (Some(gpu), Some(scene)) =
+                                    (self.gpu.as_ref(), self.scene.as_mut())
+                                {
+                                    scene.bind_galaxy_source(&gpu.device, &gpu.queue, None, 0, 0);
+                                }
+                                self.camera = OrbitCamera::default();
+                            } else if let (Some(gpu), Some(scene)) =
+                                (self.gpu.as_ref(), self.scene.as_mut())
+                            {
+                                let gm = galaxy_mode::GalaxyMode::new_research(&gpu.device, &gpu.queue);
+                                scene.bind_galaxy_source(
+                                    &gpu.device,
+                                    &gpu.queue,
+                                    Some(gm.pos_buffer()),
+                                    gm.n_a(),
+                                    gm.sun_index().unwrap_or(u32::MAX),
+                                );
+                                self.galaxy = Some(gm);
+                                self.viewpoint = Viewpoint::Free;
+                                self.camera.target = DVec3::ZERO;
+                                self.camera.min_radius = 1.0e-3;
+                                self.camera.radius = 160.0; // ~kpc: frame the whole pair
+                                self.camera.theta = 0.7;
+                                self.camera.phi = 0.45;
+                            }
+                        }
                         "r" => self.trails.clear(),
                         "k" => {
                             if self.edu.is_some() {
@@ -1819,7 +1948,7 @@ impl ApplicationHandler for App {
                                 if let (Some(gpu), Some(scene)) =
                                     (self.gpu.as_ref(), self.scene.as_mut())
                                 {
-                                    scene.bind_galaxy_source(&gpu.device, &gpu.queue, None, 0);
+                                    scene.bind_galaxy_source(&gpu.device, &gpu.queue, None, 0, 0);
                                 }
                                 self.camera = OrbitCamera::default();
                             } else if let (Some(gpu), Some(scene)) =
@@ -1833,6 +1962,7 @@ impl ApplicationHandler for App {
                                     &gpu.queue,
                                     Some(gm.pos_buffer()),
                                     gm.n_a(),
+                                    gm.sun_index().unwrap_or(u32::MAX),
                                 );
                                 self.galaxy = Some(gm);
                                 self.viewpoint = Viewpoint::Free;
