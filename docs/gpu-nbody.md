@@ -482,10 +482,45 @@ per-lane walk automatically.
 
 **Tally.** The tree walk went 68.7 → 25.2 → 12.8 ms — **5.4× overall** — and a full
 force step 71.7 → 18.6 ms, all with the same tree and no loss of accuracy (the θ = 0
-resident test still matches the CPU leapfrog exactly). The walk is now closer to
-compute-bound; the remaining cheap knob is the opening angle θ (raising it lumps more
-and visits fewer nodes — faster, slightly rougher, fine for a visual sim), and the sort
-and refit are now a visible slice worth revisiting if more is needed.
+resident test still matches the CPU leapfrog exactly).
+
+## 11. Pushing toward a million — and where the wall is
+
+Scaling the same code up (a profiler that takes `SOLSIM_N`/`SOLSIM_THETA` runs the real
+pipeline on the GPU) shows the walk staying dominant, and shows *where it stops*:
+
+| bodies | full force step (θ = 0.8) | ≈ fps |
+|-------:|--------------------------:|------:|
+| 250 000 | 30 ms | ~33 |
+| 500 000 | 64 ms | ~16 |
+| 1 000 000 | 137 ms | ~7 |
+
+**θ, the accuracy knob.** θ sets when a clump is "far enough" to lump. Bigger θ visits
+fewer nodes: at a million bodies the walk is 166 ms at θ = 0.6, 87 ms at 0.8, 52 ms at
+1.0. For a *visual* galaxy that is a fine trade, so the default is 0.8 and the `[` / `]`
+keys change it live (a single uniform write — nothing rebuilds).
+
+**Then draw-from-GPU (§9) paid off at scale.** Copying a million positions back,
+rebuilding a million point sprites on the CPU, and re-uploading them every frame is
+tens of milliseconds of work that simply vanishes when the vertex shader reads the
+position buffer directly. At a million bodies that is the difference between a moving
+picture and a slideshow, independent of the physics.
+
+**What did _not_ work — and why that's the answer.** The walk is memory-bound, so the
+tempting next idea was to raise **occupancy**: each lane carries a 64-entry stack (64
+registers), which caps how many warps run at once, so we tried keeping one stack per
+subgroup in shared memory and `subgroupBroadcast`-ing the current node to the lanes.
+It was *slower* (92 vs 87 ms). The lesson is the diagnosis itself: a memory-bound
+kernel is not helped by freeing registers — the broadcast and shared-memory traffic
+just added work while the bottleneck (bytes pulled through the cache per node) stayed
+put. We had already squeezed the bytes (§10), and the masses are too small to survive
+`f16`, so the walk is genuinely close to this laptop GPU's bandwidth floor.
+
+**So the honest ceiling on this hardware (an RTX A500 laptop GPU):** ~250–300k bodies
+at 60 fps, ~500k around 30, and a million at roughly 10 fps (θ = 1.0) — bandwidth,
+not cleverness, is the limit there. The remaining compute win is a radix sort (the
+bitonic sort is ~30 ms at a million; an O(N) sort would be a few), which most helps the
+250k–500k range where the framerate is already comfortable.
 
 ---
 
