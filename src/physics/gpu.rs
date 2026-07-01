@@ -1823,11 +1823,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// How many refit levels to run each step. The frontier rises one level per pass, so
-/// this must exceed the tree's height; a Morton+index tree over `n` leaves is at most
-/// ~`30 + log₂ n` deep, so 64 covers well past the 100k-body target. Extra passes are
-/// harmless no-ops (already-finished nodes just carry forward).
-const REFIT_PASSES: usize = 64;
+/// How many refit levels a tree over `n` leaves can possibly need.
+///
+/// What: a safe upper bound on the tree's height (the refit rises one level per pass,
+/// so it must run at least this many).
+/// How/why: down any root→leaf path of a Karras radix tree the split bit position
+/// strictly increases, so the depth is bounded by the number of bit positions the keys
+/// can split on: the 30-bit Morton code gives at most 30, and once codes tie, the index
+/// tiebreak gives at most `⌈log₂ n⌉` more. Hence height ≤ `30 + ⌈log₂ n⌉`; we add a
+/// small margin. Running this many (rather than a flat 64) skips the passes a shallower
+/// tree does not need — they were pure no-ops — with the identical result.
+/// Units: a count of passes.
+fn refit_passes(n: usize) -> usize {
+    let ceil_log2 = n.next_power_of_two().trailing_zeros() as usize;
+    30 + ceil_log2 + 4 // +4 margin over the proven bound
+}
 
 /// A fully GPU-resident Barnes–Hut N-body simulation.
 ///
@@ -1853,6 +1863,7 @@ pub struct GpuNBody {
     uni_trav: wgpu::Buffer,
     uni_integ: wgpu::Buffer,
     num_tiles: u32,
+    refit_passes: usize,
     soft2: f32,
     g: f32,
     // Pipelines.
@@ -2258,6 +2269,7 @@ impl GpuNBody {
             uni_trav,
             uni_integ,
             num_tiles: num_tiles as u32,
+            refit_passes: refit_passes(n),
             soft2: softening * softening,
             g,
             p_pre,
@@ -2339,7 +2351,7 @@ impl GpuNBody {
         one(enc, &self.p_gather, &self.b_gather, &[], gn);
         one(enc, &self.p_seed, &self.b_seed, &[], gtot);
         one(enc, &self.p_lbvh, &self.b_lbvh, &[], gn);
-        for i in 0..REFIT_PASSES {
+        for i in 0..self.refit_passes {
             let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
             one(enc, &self.p_agg, bg, &[], gtot);
         }
@@ -2516,8 +2528,8 @@ impl GpuNBody {
         out.push(bench("gather", &mut |e| one(e, &self.p_gather, &self.b_gather, &[], gn)));
         out.push(bench("seed", &mut |e| one(e, &self.p_seed, &self.b_seed, &[], gtot)));
         out.push(bench("lbvh-build", &mut |e| one(e, &self.p_lbvh, &self.b_lbvh, &[], gn)));
-        out.push(bench("refit(64)", &mut |e| {
-            for i in 0..REFIT_PASSES {
+        out.push(bench("refit", &mut |e| {
+            for i in 0..self.refit_passes {
                 let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
                 one(e, &self.p_agg, bg, &[], gtot);
             }
@@ -2623,9 +2635,9 @@ impl GpuNBody {
             disp(&mut e, &qset, &self.p_gather, &self.b_gather, gn, None, Some(5));
             disp(&mut e, &qset, &self.p_seed, &self.b_seed, gtot, None, Some(6));
             disp(&mut e, &qset, &self.p_lbvh, &self.b_lbvh, gn, None, Some(7));
-            for i in 0..REFIT_PASSES {
+            for i in 0..self.refit_passes {
                 let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
-                let end = if i == REFIT_PASSES - 1 { Some(8) } else { None };
+                let end = if i == self.refit_passes - 1 { Some(8) } else { None };
                 disp(&mut e, &qset, &self.p_agg, bg, gtot, None, end);
             }
             disp(&mut e, &qset, &self.p_size, &self.b_size, gtot, None, Some(9));
@@ -2749,6 +2761,55 @@ mod tests {
         bench("radix", &|| {
             radix_sort_gpu(&device, &queue, &keys, &vals);
         });
+    }
+
+    /// `refit_passes(n)` must be ≥ the actual height of real LBVH trees.
+    ///
+    /// The resident refit runs a fixed `refit_passes(n)` levels instead of looping
+    /// until the root is done, which is only correct if that count never undershoots
+    /// the tree's height. We build trees (including a heavily-duplicated-code case that
+    /// forces deep index-tiebreak chains), measure each tree's height from its
+    /// structure, and check the bound holds with room to spare.
+    #[test]
+    fn refit_passes_covers_tree_height() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        // (label, seed, code range) — small range ⇒ many duplicate codes ⇒ deep trees.
+        let cases = [("distinct", 0x1111u64, 1u32 << 30), ("dup-heavy", 0x2222, 40)];
+        for (label, seed, range) in cases {
+            let mut rng = Rng::new(seed);
+            let n = 20_000usize;
+            let mut codes: Vec<u32> = (0..n).map(|_| (rng.unit() * range as f64) as u32).collect();
+            codes.sort();
+
+            let (left, right, _parent) = build_lbvh_structure_gpu(&device, &queue, &codes);
+            let leaf_base = (n - 1) as u32;
+            // Post-order (reverse preorder): each node's subtree height in internal levels.
+            let mut order = Vec::with_capacity(2 * n - 1);
+            let mut stack = vec![0u32];
+            while let Some(nd) = stack.pop() {
+                order.push(nd);
+                if nd < leaf_base {
+                    stack.push(right[nd as usize]);
+                    stack.push(left[nd as usize]);
+                }
+            }
+            let mut h = vec![0u32; 2 * n - 1]; // leaves stay 0
+            for &nd in order.iter().rev() {
+                if nd < leaf_base {
+                    let (l, r) = (left[nd as usize] as usize, right[nd as usize] as usize);
+                    h[nd as usize] = 1 + h[l].max(h[r]);
+                }
+            }
+            let height = h[0]; // passes the root actually needs
+            let budget = refit_passes(n) as u32;
+            assert!(
+                budget >= height,
+                "{label}: refit_passes({n}) = {budget} < tree height {height}"
+            );
+        }
     }
 
     /// The GPU radix sort must match a plain CPU sort by `(key, index)`.

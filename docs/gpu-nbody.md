@@ -391,11 +391,13 @@ each stage is its own compute pass, the pass boundaries supply all the ordering 
 same mechanism the sort and the refit already relied on.
 
 **Two small design choices that avoid readbacks mid-step.** The refit's convergence
-depends on the tree height, which we don't know without looking; rather than read a
-flag back each level, we just run a **fixed 64 passes** — comfortably more than the
-`~30 + log₂N` a Morton tree can ever be deep, and extra passes are free no-ops. And
-the traversal stack is a fixed 64 entries for the same reason. So the entire step is
-GPU-only.
+depends on the tree height, which we don't know exactly without looking — but we know a
+tight *bound*. Down any root→leaf path of a Karras tree the split bit position strictly
+increases, so the depth is at most `30 + ⌈log₂N⌉` (30 code bits, then the index
+tiebreak). So rather than read a flag back each level, we run exactly that many passes
+(plus a small margin) — enough to guarantee the root is filled, and no more; the passes
+a shallower tree doesn't need were only ever no-ops. The traversal stack is a fixed 64
+entries by the same bound. So the entire step is GPU-only.
 
 **And nothing comes back at all.** The point renderer draws **straight from the
 position buffer**: a vertex shader reads `pos[instance_index]`, colours it by index
