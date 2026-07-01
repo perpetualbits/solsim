@@ -29,10 +29,12 @@ into clean, separately-testable phases:
 | 3 | Morton codes | a Z-order key per particle |
 | 4 | **sort** | order particles along the curve |
 | 5a | LBVH structure | a tree over the sorted particles |
-| 5b | node mass/COM | aggregate up the tree |
-| 6 | traverse + integrate | the actual gravity + leapfrog step |
+| 5b | node mass/COM/box | aggregate up the tree |
+| 6 | traverse (forces) | the actual gravity on every body |
+| — | resident + integrate | keep it all on the GPU, leapfrog step |
 
-Phases 0, 2, 3, 4, 5a and 5b are implemented and validated so far.
+Phases 0, 2, 3, 4, 5a, 5b and 6 (the forces) are implemented and validated; only
+making the state GPU-resident and adding the integration step remain.
 
 ## 2. A short GPU-compute crash course (wgpu)
 
@@ -309,12 +311,67 @@ and a second tiny pass to combine them.
 12 345 random points (not a multiple of 256, so the strided tail is exercised). The
 box corners are exact copies of input floats, so the comparison is exact.
 
-## 8. Still to come
+## 8. Phase 6 — walking the tree for the forces
 
-- **Phase 6 — traverse + integrate**: one thread per particle walks the tree
-  (lump-or-open using each node's mass/COM/size, just like the CPU version), then a
-  leapfrog kick-drift-kick updates the resident position/velocity buffers, which the
-  point renderer draws directly.
+Everything so far was scaffolding; this is the gravity. One thread per particle
+walks the finished tree and sums the pull, lumping distant clumps and opening near
+ones — the same Barnes–Hut idea as the CPU octree (`TRAVERSE_SHADER`,
+`accelerations_gpu`).
 
-Each lands as its own kernel with its own CPU-reference test, so the whole GPU
-pipeline is trustworthy end to end even though the tree lives entirely on the card.
+**One extra thing the nodes needed: a size.** The opening test asks "is this node
+small compared with its distance?", so each node needs a spatial size. We already
+had a bottom-up refit (§6), so we taught it to also carry each node's **axis-aligned
+box** (min/max corner): a leaf's box is its point, an internal node's is the union of
+its children's. The node's size is then the box **diagonal**. (We first tried the
+longest side; it lumps a hair too eagerly and the error sat just over the bar. The
+diagonal is a little more conservative — it opens slightly more — and lands the
+accuracy right where the CPU octree is. Choosing the size measure *is* choosing the
+accuracy.)
+
+**The walk, with a private stack.** A GPU thread can't recurse, so each carries a
+small fixed stack (64 entries — plenty, since a tree over `N` leaves is at most about
+`30 + log₂N` deep). Starting from the root:
+
+```
+push root
+while stack not empty:
+    node = pop
+    r⃗ = node.com − my_position;   r² = r⃗·r⃗
+    if node is a leaf:
+        add its softened pull        # the leaf that is ME has r⃗ = 0 → adds nothing
+    else if node.size² < θ²·r²:      # far enough: treat the whole node as one body
+        add its softened pull
+    else:
+        push node.left, node.right   # too close: open it
+```
+
+Each pull is the same softened law as everywhere else,
+`a⃗ = G·m·r⃗ / (|r⃗|² + ε²)^{3/2}`. A neat consequence of softening: we don't special-
+case "don't pull on yourself" — the leaf holding this very particle has `r⃗ = 0`, so
+`m·r⃗ = 0` and it contributes nothing on its own.
+
+**Order in, order out.** The particles were permuted into Morton order to build the
+tree, so the walk produces accelerations in *that* order; `accelerations_gpu` scatters
+them back to the caller's original indices at the end.
+
+### Trusting it
+
+`gpu_accelerations_match_direct_sum` runs the *entire* pipeline on 3000 random bodies
+and compares every acceleration against the exact O(N²) softened sum — the same
+ground truth (and the same tolerances, θ = 0.5) the CPU octree is held to. The GPU
+tree is a *binary* LBVH, not the CPU's octree, so the two differ node-for-node; that
+they both land within Barnes–Hut error of the direct sum is exactly the point. Mean
+relative error comes out well under 1 %.
+
+## 9. Still to come
+
+- **Make it resident and integrate.** The reference `accelerations_gpu` reads each
+  stage back to the CPU and re-uploads it — fine for testing, wasteful for real time.
+  The live version keeps positions, velocities and the tree in GPU buffers across the
+  whole step, runs a leapfrog kick–drift–kick in a compute shader, and lets the point
+  renderer draw straight from the position buffer — no per-frame copy. That is the
+  last phase: wiring this into the galaxy mode in `galaxy_mode.rs` / `main.rs`.
+
+Each phase landed as its own kernel with its own CPU-reference test, so the whole GPU
+pipeline — box, codes, sort, tree, masses, forces — is trustworthy end to end even
+though it all lives on the card.

@@ -565,12 +565,15 @@ struct Uni { n: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(4) var<storage, read_write> node_com: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> done_in: array<u32>;
 @group(0) @binding(6) var<storage, read_write> done_out: array<u32>;
+@group(0) @binding(7) var<storage, read_write> node_lo: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> node_hi: array<vec4<f32>>;
 
 // One level of the bottom-up refit. Runs once per pass; every pass lifts the
 // "finished" frontier up by one level. A node combines only when BOTH children were
-// finished in an EARLIER pass, so their mass/com writes (from that earlier submit)
-// are already visible — that pass boundary is what makes this safe without relying
-// on GPU atomics or a cross-workgroup memory model.
+// finished in an EARLIER pass, so their writes (from that earlier submit) are already
+// visible — that pass boundary is what makes this safe without relying on GPU atomics
+// or a cross-workgroup memory model. Each node gets its total mass, centre of mass,
+// and the axis-aligned box enclosing its part (the box gives its size for opening).
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -588,27 +591,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = (ml * node_com[l].xyz + mr * node_com[r].xyz) / m;  // mass-weighted centre
     node_mass[i] = m;
     node_com[i] = vec4<f32>(c, m);
+    node_lo[i] = vec4<f32>(min(node_lo[l].xyz, node_lo[r].xyz), 0.0);
+    node_hi[i] = vec4<f32>(max(node_hi[l].xyz, node_hi[r].xyz), 0.0);
     done_out[i] = 1u;
 }
 "#;
 
 /// Aggregate each tree node's total mass and centre of mass, bottom-up, on the GPU.
 ///
+/// The per-node arrays this refit produces: `(mass, com, box_lo, box_hi)`, one entry
+/// per node (`.w` lanes unused except that `com.w` also carries the mass).
+type NodeArrays = (Vec<f32>, Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<[f32; 4]>);
+
 /// What: given the LBVH structure and the per-leaf masses/positions (in sorted
-/// order), returns `(node_mass, node_com)` for all `2n-1` nodes — leaves hold their
-/// own particle, internal nodes the combined mass and centre of mass of their part.
+/// order), returns `(node_mass, node_com, node_lo, node_hi)` for all `2n-1` nodes —
+/// leaves hold their own particle, internal nodes the combined mass, centre of mass,
+/// and the axis-aligned box enclosing their part (which gives their size for the
+/// opening test).
 /// How/why: the tree is filled in **levels**. Leaves start "finished"; each pass, an
 /// internal node whose two children were finished in an earlier pass sets its own
-/// `M = m₁+m₂` and `C = (m₁·c₁+m₂·c₂)/M` and marks itself finished. The "finished"
-/// flags are double-buffered (`done_in`/`done_out`, swapped each pass) so a node is
-/// never combined from a child produced in the very same pass. We keep dispatching
-/// until the root is finished. Each pass is its own submit, and that boundary is
-/// what guarantees a child's writes are visible before its parent reads them — the
-/// robust alternative to a single-pass atomic walk-up, whose cross-workgroup reads
-/// are not covered by WGSL's memory model.
+/// `M = m₁+m₂`, `C = (m₁·c₁+m₂·c₂)/M`, and box = union of the children's boxes, then
+/// marks itself finished. The "finished" flags are double-buffered
+/// (`done_in`/`done_out`, swapped each pass) so a node is never combined from a child
+/// produced in the very same pass. We keep dispatching until the root is finished.
+/// Each pass is its own submit, and that boundary is what guarantees a child's writes
+/// are visible before its parent reads them — the robust alternative to a single-pass
+/// atomic walk-up, whose cross-workgroup reads are not covered by WGSL's memory model.
 /// The physics: a node's centre of mass is the mass-weighted average of its parts —
 /// exactly what Barnes–Hut treats as one distant body when it "lumps" a node.
-/// Units: masses in solar masses, positions/COM in AU (whatever the leaves use).
+/// Units: masses in solar masses, positions/COM/box in AU (whatever the leaves use).
 pub fn aggregate_nodes_gpu(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -617,7 +628,7 @@ pub fn aggregate_nodes_gpu(
     parent: &[u32],
     leaf_mass: &[f32],
     leaf_com: &[[f32; 4]],
-) -> (Vec<f32>, Vec<[f32; 4]>) {
+) -> NodeArrays {
     let n = leaf_mass.len();
     assert!(n >= 2, "need at least two particles");
     assert_eq!(left.len(), n - 1);
@@ -628,12 +639,17 @@ pub fn aggregate_nodes_gpu(
     let total = 2 * n - 1;
 
     // Seed the node arrays on the CPU: leaf k lives at node id (n-1)+k, internal
-    // nodes start at zero and are overwritten before they are ever read.
+    // nodes start at zero and are overwritten before they are ever read. A leaf's
+    // box is the single point of its particle.
     let mut mass_init = vec![0.0f32; total];
     let mut com_init = vec![[0.0f32; 4]; total];
+    let mut lo_init = vec![[0.0f32; 4]; total];
+    let mut hi_init = vec![[0.0f32; 4]; total];
     for k in 0..n {
         mass_init[internal + k] = leaf_mass[k];
         com_init[internal + k] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2], leaf_mass[k]];
+        lo_init[internal + k] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2], 0.0];
+        hi_init[internal + k] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2], 0.0];
     }
     // "Finished" flags: leaves start finished, internal nodes not. Two identical
     // copies so we can ping-pong (leaf entries are never written, so they stay 1).
@@ -663,6 +679,8 @@ pub fn aggregate_nodes_gpu(
     let rgt_buf = ro(bytemuck::cast_slice(right), "agg rgt");
     let mass_buf = rw_init(bytemuck::cast_slice(&mass_init), "agg node mass");
     let com_buf = rw_init(bytemuck::cast_slice(&com_init), "agg node com");
+    let lo_buf = rw_init(bytemuck::cast_slice(&lo_init), "agg node lo");
+    let hi_buf = rw_init(bytemuck::cast_slice(&hi_init), "agg node hi");
     let done_a = rw_init(bytemuck::cast_slice(&done_init), "agg done a");
     let done_b = rw_init(bytemuck::cast_slice(&done_init), "agg done b");
 
@@ -680,6 +698,8 @@ pub fn aggregate_nodes_gpu(
             storage_entry(4, false),
             storage_entry(5, true),
             storage_entry(6, false),
+            storage_entry(7, false),
+            storage_entry(8, false),
         ],
     });
     // Two bind groups that swap which "done" buffer is read vs written each pass.
@@ -695,6 +715,8 @@ pub fn aggregate_nodes_gpu(
                 wgpu::BindGroupEntry { binding: 4, resource: com_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: din.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: dout.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: lo_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: hi_buf.as_entire_binding() },
             ],
         })
     };
@@ -753,17 +775,265 @@ pub fn aggregate_nodes_gpu(
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     let mass_back = readback_buffer(device, (total * 4) as u64);
     let com_back = readback_buffer(device, (total * 16) as u64);
+    let lo_back = readback_buffer(device, (total * 16) as u64);
+    let hi_back = readback_buffer(device, (total * 16) as u64);
     encoder.copy_buffer_to_buffer(&mass_buf, 0, &mass_back, 0, (total * 4) as u64);
     encoder.copy_buffer_to_buffer(&com_buf, 0, &com_back, 0, (total * 16) as u64);
+    encoder.copy_buffer_to_buffer(&lo_buf, 0, &lo_back, 0, (total * 16) as u64);
+    encoder.copy_buffer_to_buffer(&hi_buf, 0, &hi_back, 0, (total * 16) as u64);
     queue.submit(Some(encoder.finish()));
 
+    let to_vec4 = |flat: Vec<f32>| -> Vec<[f32; 4]> {
+        flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    };
     let mass = map_f32(device, &mass_back, total);
-    let com_flat = map_f32(device, &com_back, total * 4);
-    let com: Vec<[f32; 4]> = com_flat
-        .chunks_exact(4)
-        .map(|c| [c[0], c[1], c[2], c[3]])
-        .collect();
-    (mass, com)
+    let com = to_vec4(map_f32(device, &com_back, total * 4));
+    let lo = to_vec4(map_f32(device, &lo_back, total * 4));
+    let hi = to_vec4(map_f32(device, &hi_back, total * 4));
+    (mass, com, lo, hi)
+}
+
+const TRAVERSE_SHADER: &str = r#"
+struct Uni { n: u32, theta2: f32, soft2: f32, g: f32 };
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var<storage, read> node_mass: array<f32>;
+@group(0) @binding(2) var<storage, read> node_com: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> node_lo: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> node_hi: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> lft: array<u32>;
+@group(0) @binding(6) var<storage, read> rgt: array<u32>;
+@group(0) @binding(7) var<storage, read_write> out_acc: array<vec4<f32>>;
+
+// Barnes–Hut gravity on one particle by walking the tree with a private stack.
+// For each node: if it is a far-enough lump (size² < θ²·r²) add its pull and don't
+// descend; otherwise push its two children and keep going. Leaves are single
+// particles; the leaf that IS this particle contributes nothing because its offset
+// r⃗ = 0 makes the numerator m·r⃗ vanish, so no self-force test is needed. Each pull
+// uses the softened law a⃗ = G·m·r⃗ / (|r⃗|² + ε²)^{3/2}, matching the CPU octree.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= u.n) { return; }
+    let leaf_base = u.n - 1u;                 // internal nodes 0…n-2, leaves n-1…2n-2
+    let pi = node_com[leaf_base + k].xyz;      // this particle's position
+
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    var stack: array<u32, 64>;
+    var sp = 0u;
+    stack[0] = 0u; sp = 1u;                    // start at the root (internal node 0)
+
+    loop {
+        if (sp == 0u) { break; }
+        sp = sp - 1u;
+        let node = stack[sp];
+        let d = node_com[node].xyz - pi;
+        let r2 = dot(d, d);
+
+        if (node >= leaf_base) {
+            // A leaf: one particle. Self gives d=0 → adds nothing.
+            let soft = r2 + u.soft2;
+            acc = acc + node_mass[node] * d / (soft * sqrt(soft));
+        } else {
+            // Internal node: lump if far enough, else open it.
+            let ext = node_hi[node].xyz - node_lo[node].xyz;
+            let s2 = dot(ext, ext);                   // node size² = box diagonal²
+            if (s2 < u.theta2 * r2) {
+                let soft = r2 + u.soft2;
+                acc = acc + node_mass[node] * d / (soft * sqrt(soft));
+            } else if (sp <= 62u) {                  // room for two children
+                stack[sp] = lft[node]; sp = sp + 1u;
+                stack[sp] = rgt[node]; sp = sp + 1u;
+            }
+        }
+    }
+    out_acc[k] = vec4<f32>(acc * u.g, 0.0);
+}
+"#;
+
+/// Barnes–Hut accelerations for every particle, entirely on the GPU.
+///
+/// What: runs the whole pipeline — bounding box, Morton codes, sort, LBVH build,
+/// node mass/COM/box, then a per-particle tree walk — and returns the acceleration
+/// on each input particle, in the caller's original order.
+/// How/why: this composes the earlier phases. Positions are ordered along the Morton
+/// curve (so tree leaves are the sorted particles); after the walk we scatter the
+/// per-leaf accelerations back to the original order. The walk itself uses the same
+/// opening test and softened law as the CPU [`octree`](super::octree), so it must
+/// agree with the direct O(N²) sum to Barnes–Hut accuracy.
+/// Principle: Newton's gravity with distant crowds replaced by their centre of mass.
+/// Units: `pos` (its `.w` ignored) and `mass` in the caller's units; `theta`
+/// dimensionless; `softening` a length; `g` the gravitational constant. Returns
+/// accelerations in those units.
+pub fn accelerations_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pos: &[[f32; 4]],
+    mass: &[f32],
+    theta: f32,
+    softening: f32,
+    g: f32,
+) -> Vec<Vec3> {
+    let n = pos.len();
+    assert!(n >= 2, "need at least two particles");
+    assert_eq!(mass.len(), n);
+
+    // Build steps (each reads its input back and re-uploads — fine for a reference
+    // path; the real-time version will keep the buffers resident, see the doc).
+    let (lo, hi) = bounding_box_gpu(device, queue, pos);
+    let inv = Vec3::ONE / (hi - lo).max(Vec3::splat(1e-20)); // guard a flat axis
+    let codes = compute_morton_gpu(device, queue, pos, lo, inv);
+    let idx: Vec<u32> = (0..n as u32).collect();
+    let (sorted_codes, order) = bitonic_sort_gpu(device, queue, &codes, &idx);
+
+    // Reorder particles into the sorted (leaf) order the tree is built on.
+    let leaf_com: Vec<[f32; 4]> = order.iter().map(|&o| pos[o as usize]).collect();
+    let leaf_mass: Vec<f32> = order.iter().map(|&o| mass[o as usize]).collect();
+
+    let (left, right, parent) = build_lbvh_structure_gpu(device, queue, &sorted_codes);
+    let (node_mass, node_com, node_lo, node_hi) =
+        aggregate_nodes_gpu(device, queue, &left, &right, &parent, &leaf_mass, &leaf_com);
+
+    // The tree walk.
+    let acc_sorted = traverse_gpu(
+        device, queue, &node_mass, &node_com, &node_lo, &node_hi, &left, &right, theta, softening, g,
+    );
+
+    // Scatter accelerations back to the caller's original particle order.
+    let mut acc = vec![Vec3::ZERO; n];
+    for (k, &o) in order.iter().enumerate() {
+        acc[o as usize] = acc_sorted[k];
+    }
+    acc
+}
+
+/// Walk the finished tree once per particle and return each one's acceleration.
+///
+/// What: the [`TRAVERSE_SHADER`] step in isolation — given the node arrays and the
+/// child links, returns the acceleration on each leaf particle (in sorted order).
+/// How/why: one thread per particle, a private lump-or-open stack walk. Split out so
+/// [`accelerations_gpu`] reads cleanly and the walk can be tested on a known tree.
+/// Units: as [`accelerations_gpu`].
+#[allow(clippy::too_many_arguments)]
+fn traverse_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    node_mass: &[f32],
+    node_com: &[[f32; 4]],
+    node_lo: &[[f32; 4]],
+    node_hi: &[[f32; 4]],
+    left: &[u32],
+    right: &[u32],
+    theta: f32,
+    softening: f32,
+    g: f32,
+) -> Vec<Vec3> {
+    let total = node_mass.len();
+    let n = total.div_ceil(2); // total = 2n-1
+    let uni = Uniforms {
+        n: n as u32,
+        theta2: theta * theta,
+        soft2: softening * softening,
+        g,
+    };
+    let uni_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("traverse uni"),
+        contents: bytemuck::bytes_of(&uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let ro = |bytes: &[u8], label| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let mass_buf = ro(bytemuck::cast_slice(node_mass), "traverse mass");
+    let com_buf = ro(bytemuck::cast_slice(node_com), "traverse com");
+    let lo_buf = ro(bytemuck::cast_slice(node_lo), "traverse lo");
+    let hi_buf = ro(bytemuck::cast_slice(node_hi), "traverse hi");
+    let lft_buf = ro(bytemuck::cast_slice(left), "traverse lft");
+    let rgt_buf = ro(bytemuck::cast_slice(right), "traverse rgt");
+    let acc_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("traverse acc"),
+        size: (n * 16) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("traverse"),
+        source: wgpu::ShaderSource::Wgsl(TRAVERSE_SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("traverse layout"),
+        entries: &[
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            storage_entry(5, true),
+            storage_entry(6, true),
+            storage_entry(7, false),
+        ],
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("traverse bind"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: mass_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: com_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: lo_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: hi_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: lft_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: rgt_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: acc_buf.as_entire_binding() },
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("traverse pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("traverse pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("traverse"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+    }
+    let acc_back = readback_buffer(device, (n * 16) as u64);
+    encoder.copy_buffer_to_buffer(&acc_buf, 0, &acc_back, 0, (n * 16) as u64);
+    queue.submit(Some(encoder.finish()));
+
+    let flat = map_f32(device, &acc_back, n * 4);
+    flat.chunks_exact(4)
+        .map(|c| Vec3::new(c[0], c[1], c[2]))
+        .collect()
+}
+
+/// Uniform block for the traversal kernel (16-byte aligned for the GPU).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    n: u32,
+    theta2: f32,
+    soft2: f32,
+    g: f32,
 }
 
 const BBOX_SHADER: &str = r#"
@@ -1219,12 +1489,14 @@ mod tests {
             .collect();
 
         let (left, right, parent) = build_lbvh_structure_gpu(&device, &queue, &codes);
-        let (mass, com) =
+        let (mass, com, node_lo, node_hi) =
             aggregate_nodes_gpu(&device, &queue, &left, &right, &parent, &leaf_mass, &leaf_com);
 
         let total = 2 * n - 1;
         assert_eq!(mass.len(), total);
         assert_eq!(com.len(), total);
+        assert_eq!(node_lo.len(), total);
+        assert_eq!(node_hi.len(), total);
 
         // CPU refit: preorder from the root, then process in reverse so every node's
         // two children are finished before the node itself.
@@ -1240,12 +1512,17 @@ mod tests {
         }
         let mut cmass = vec![0.0f32; total];
         let mut ccom = vec![[0.0f32; 3]; total];
+        let mut clo = vec![[0.0f32; 3]; total];
+        let mut chi = vec![[0.0f32; 3]; total];
         for &node in order.iter().rev() {
             let id = node as usize;
             if node >= leaf_base {
                 let k = (node - leaf_base) as usize;
+                let p = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2]];
                 cmass[id] = leaf_mass[k];
-                ccom[id] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2]];
+                ccom[id] = p;
+                clo[id] = p;
+                chi[id] = p;
             } else {
                 let (l, r) = (left[id] as usize, right[id] as usize);
                 let (ml, mr) = (cmass[l], cmass[r]);
@@ -1253,6 +1530,8 @@ mod tests {
                 cmass[id] = m;
                 for a in 0..3 {
                     ccom[id][a] = (ml * ccom[l][a] + mr * ccom[r][a]) / m;
+                    clo[id][a] = clo[l][a].min(clo[r][a]);
+                    chi[id][a] = chi[l][a].max(chi[r][a]);
                 }
             }
         }
@@ -1281,8 +1560,75 @@ mod tests {
                     com[id][a],
                     ccom[id][a]
                 );
+                // The box (min/max) is built from exact copies, so it must match
+                // exactly — this is what the traversal uses for each node's size.
+                assert_eq!(node_lo[id][a], clo[id][a], "lo mismatch at node {id} axis {a}");
+                assert_eq!(node_hi[id][a], chi[id][a], "hi mismatch at node {id} axis {a}");
             }
         }
+    }
+
+    /// The full GPU Barnes–Hut pipeline must agree with the exact O(N²) sum.
+    ///
+    /// This is the same yardstick the CPU octree uses: build a random cloud, compute
+    /// every particle's acceleration on the GPU (bbox → Morton → sort → tree → walk),
+    /// and compare against the direct softened sum. The GPU tree is a *binary* LBVH,
+    /// not the CPU's octree, so the two trees differ node-for-node — hence we check
+    /// against the ground-truth direct sum, not the CPU tree, and only to Barnes–Hut
+    /// accuracy (θ = 0.5): small mean error, bounded worst case.
+    #[test]
+    fn gpu_accelerations_match_direct_sum() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x1357_9BDF_2468_ACE0);
+        let n = 3000usize;
+        let soft = 0.05f32;
+        let theta = 0.5f32;
+        let g = 1.0f32;
+
+        let pos3: Vec<Vec3> = (0..n)
+            .map(|_| {
+                Vec3::new(
+                    rng.unit() as f32 * 2.0 - 1.0,
+                    rng.unit() as f32 * 2.0 - 1.0,
+                    rng.unit() as f32 * 2.0 - 1.0,
+                )
+            })
+            .collect();
+        let mass: Vec<f32> = (0..n).map(|_| 0.5 + rng.unit() as f32).collect();
+        let pos4: Vec<[f32; 4]> = pos3.iter().map(|p| [p.x, p.y, p.z, 0.0]).collect();
+
+        let gpu = accelerations_gpu(&device, &queue, &pos4, &mass, theta, soft, g);
+        assert_eq!(gpu.len(), n);
+
+        // Direct softened O(N²) sum — the ground truth.
+        let soft2 = soft * soft;
+        let direct = |i: usize| -> Vec3 {
+            let mut a = Vec3::ZERO;
+            for j in 0..n {
+                if j == i {
+                    continue;
+                }
+                let d = pos3[j] - pos3[i];
+                let s = d.length_squared() + soft2;
+                a += mass[j] * d / (s * s.sqrt());
+            }
+            a * g
+        };
+
+        let mut sum_rel = 0.0f32;
+        let mut worst = 0.0f32;
+        for i in 0..n {
+            let d = direct(i);
+            let rel = (gpu[i] - d).length() / d.length().max(1e-6);
+            sum_rel += rel;
+            worst = worst.max(rel);
+        }
+        let mean = sum_rel / n as f32;
+        assert!(mean < 0.01, "mean relative error {mean} too high");
+        assert!(worst < 0.15, "worst relative error {worst} too high");
     }
 
     use wgpu::util::DeviceExt;
