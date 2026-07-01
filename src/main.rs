@@ -253,6 +253,12 @@ impl Gpu {
             force_fallback_adapter: false,
         }))?;
 
+        // Report which GPU we got — on a dual-GPU laptop the surface-present
+        // constraint can pin us to the integrated GPU even with a high-performance
+        // request, which matters for the galaxy compute work.
+        let info = adapter.get_info();
+        println!("GPU: {} [{:?}, {:?}]", info.name, info.device_type, info.backend);
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("solarsim device"),
