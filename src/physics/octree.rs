@@ -241,16 +241,21 @@ impl Octree {
         }
     }
 
-    /// Build a tree and return the acceleration on every body (single-threaded).
+    /// Build a tree and return the acceleration on every body, in parallel.
     ///
-    /// What: the convenient one-call version — build once, query all bodies.
-    /// How/why: the per-body queries are independent and read-only, so this loop is
-    /// the natural place to spread across cores later (e.g. with `rayon`); for now
-    /// it is a plain sequential map so correctness is easy to check.
+    /// What: the convenient one-call version — build once, query all bodies across
+    /// all CPU cores.
+    /// How/why: the built tree is read-only, and each body's query only reads it, so
+    /// the per-body loop is embarrassingly parallel; `rayon` spreads it over the
+    /// cores. `into_par_iter` over a range keeps the results in order, so the output
+    /// is identical to (and as deterministic as) the sequential version — the tests
+    /// that check it against the direct sum therefore also check the parallel path.
     /// Units: as [`build`] / [`acceleration`].
     pub fn accelerations(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64, g: f64) -> Vec<DVec3> {
+        use rayon::prelude::*;
         let tree = Octree::build(pos, mass, theta, softening);
         (0..pos.len())
+            .into_par_iter()
             .map(|i| tree.acceleration(i, pos, mass, g))
             .collect()
     }
