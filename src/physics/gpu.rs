@@ -1972,7 +1972,11 @@ impl GpuNBody {
             "uni sort",
         );
         let trav = Uniforms { n: n as u32, theta2: theta * theta, soft2: softening * softening, g };
-        let uni_trav = init(bytemuck::bytes_of(&trav), wgpu::BufferUsages::UNIFORM, "uni trav");
+        let uni_trav = init(
+            bytemuck::bytes_of(&trav),
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "uni trav",
+        );
         let uni_integ = init(
             bytemuck::cast_slice(&[f32::from_bits(n as u32), 0.0f32, 0.0f32, 0.0f32]),
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -3041,6 +3045,7 @@ mod tests {
         let mass = vec![1.0f32 / n as f32; n]; // light particles: gentle, bounded motion
 
         let gpu = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.6, 0.1, 1.0);
+        gpu.set_theta(&queue, 0.9); // exercise the live-θ uniform write (needs COPY_DST)
         // Step *and read back* every iteration, exactly like the frame loop — this is
         // what catches the reused staging buffer being left mapped between frames.
         let mut out = Vec::new();
