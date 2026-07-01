@@ -13,7 +13,7 @@
 //! (a closed two-body orbit, conserved energy and momentum). Not drawn yet.
 #![allow(dead_code)]
 
-use glam::DVec3;
+use glam::Vec3;
 
 use super::octree::Octree;
 
@@ -26,13 +26,13 @@ use super::octree::Octree;
 /// Units: caller's own (e.g. kpc, Myr, solar masses); `theta` dimensionless,
 /// `softening` a length, `g` the gravitational constant in those units.
 pub struct Particles {
-    pub pos: Vec<DVec3>,
-    pub vel: Vec<DVec3>,
-    pub mass: Vec<f64>,
-    acc: Vec<DVec3>,
-    pub theta: f64,
-    pub softening: f64,
-    pub g: f64,
+    pub pos: Vec<Vec3>,
+    pub vel: Vec<Vec3>,
+    pub mass: Vec<f32>,
+    acc: Vec<Vec3>,
+    pub theta: f32,
+    pub softening: f32,
+    pub g: f32,
 }
 
 impl Particles {
@@ -43,12 +43,12 @@ impl Particles {
     /// How/why: leapfrog needs the acceleration *before* the first half-kick.
     /// Units: as the struct.
     pub fn new(
-        pos: Vec<DVec3>,
-        vel: Vec<DVec3>,
-        mass: Vec<f64>,
-        theta: f64,
-        softening: f64,
-        g: f64,
+        pos: Vec<Vec3>,
+        vel: Vec<Vec3>,
+        mass: Vec<f32>,
+        theta: f32,
+        softening: f32,
+        g: f32,
     ) -> Self {
         let acc = Octree::accelerations(&pos, &mass, theta, softening, g);
         Particles {
@@ -82,7 +82,7 @@ impl Particles {
     /// Principle: the same `r¨ = a` as any gravity integrator, but arranged so that
     /// errors cancel over a step instead of accumulating.
     /// Units: `dt` in the caller's time unit.
-    pub fn step(&mut self, dt: f64) {
+    pub fn step(&mut self, dt: f32) {
         let half = 0.5 * dt;
         for (v, a) in self.vel.iter_mut().zip(&self.acc) {
             *v += *a * half;
@@ -99,7 +99,7 @@ impl Particles {
     /// Total kinetic energy `Σ ½·mᵢ·vᵢ²`.
     ///
     /// Units: caller's mass·length²·time⁻².
-    pub fn kinetic_energy(&self) -> f64 {
+    pub fn kinetic_energy(&self) -> f32 {
         self.mass
             .iter()
             .zip(&self.vel)
@@ -114,7 +114,7 @@ impl Particles {
     /// dynamics; this is an O(N²) sum meant for checking small systems, not for the
     /// hot loop.
     /// Units: caller's mass·length²·time⁻².
-    pub fn potential_energy(&self) -> f64 {
+    pub fn potential_energy(&self) -> f32 {
         let soft2 = self.softening * self.softening;
         let mut pe = 0.0;
         for i in 0..self.pos.len() {
@@ -127,16 +127,16 @@ impl Particles {
     }
 
     /// Total energy (kinetic + potential); should stay nearly constant.
-    pub fn total_energy(&self) -> f64 {
+    pub fn total_energy(&self) -> f32 {
         self.kinetic_energy() + self.potential_energy()
     }
 
     /// Total momentum `Σ mᵢ·vᵢ`; conserved exactly for exact (θ = 0) forces.
-    pub fn total_momentum(&self) -> DVec3 {
+    pub fn total_momentum(&self) -> Vec3 {
         self.mass
             .iter()
             .zip(&self.vel)
-            .fold(DVec3::ZERO, |s, (m, v)| s + *v * *m)
+            .fold(Vec3::ZERO, |s, (m, v)| s + *v * *m)
     }
 }
 
@@ -145,7 +145,7 @@ mod tests {
     use super::*;
 
     /// A tiny deterministic RNG (SplitMix64) returning values in [0, 1).
-    fn rng(seed: u64) -> impl FnMut() -> f64 {
+    fn rng(seed: u64) -> impl FnMut() -> f32 {
         let mut s = seed;
         move || {
             s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -153,7 +153,7 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
-            (z >> 11) as f64 / (1u64 << 53) as f64
+            (z >> 11) as f32 / (1u64 << 53) as f32
         }
     }
 
@@ -163,9 +163,9 @@ mod tests {
     /// have kept their separation (here 1) fixed and come back to the start.
     #[test]
     fn two_body_circular_orbit_is_closed() {
-        let g: f64 = 1.0;
-        let (m1, m2): (f64, f64) = (1.0, 1.0);
-        let d: f64 = 1.0;
+        let g: f32 = 1.0;
+        let (m1, m2): (f32, f32) = (1.0, 1.0);
+        let d: f32 = 1.0;
         let mu = g * (m1 + m2);
         let v_rel = (mu / d).sqrt();
         // Place on the x-axis about the (stationary) centre of mass.
@@ -173,16 +173,16 @@ mod tests {
         let x2 = d * m1 / (m1 + m2);
         let v1 = -(m2 / (m1 + m2)) * v_rel;
         let v2 = (m1 / (m1 + m2)) * v_rel;
-        let pos = vec![DVec3::new(x1, 0.0, 0.0), DVec3::new(x2, 0.0, 0.0)];
-        let vel = vec![DVec3::new(0.0, v1, 0.0), DVec3::new(0.0, v2, 0.0)];
+        let pos = vec![Vec3::new(x1, 0.0, 0.0), Vec3::new(x2, 0.0, 0.0)];
+        let vel = vec![Vec3::new(0.0, v1, 0.0), Vec3::new(0.0, v2, 0.0)];
         let mut sys = Particles::new(pos, vel, vec![m1, m2], 0.0, 1e-3, g);
 
         let start = sys.pos[0];
-        let period = std::f64::consts::TAU * (d * d * d / mu).sqrt();
+        let period = std::f32::consts::TAU * (d * d * d / mu).sqrt();
         let steps = 4000;
-        let dt = period / steps as f64;
-        let mut min_sep = f64::INFINITY;
-        let mut max_sep = 0.0_f64;
+        let dt = period / steps as f32;
+        let mut min_sep = f32::INFINITY;
+        let mut max_sep = 0.0_f32;
         for _ in 0..steps {
             sys.step(dt);
             let sep = (sys.pos[1] - sys.pos[0]).length();
@@ -207,8 +207,8 @@ mod tests {
         let mut pos = Vec::new();
         let mut vel = Vec::new();
         for _ in 0..n {
-            pos.push(DVec3::new(rng() * 2.0 - 1.0, rng() * 2.0 - 1.0, rng() * 2.0 - 1.0));
-            vel.push(DVec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 0.1);
+            pos.push(Vec3::new(rng() * 2.0 - 1.0, rng() * 2.0 - 1.0, rng() * 2.0 - 1.0));
+            vel.push(Vec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 0.1);
         }
         let mut sys = Particles::new(pos, vel, vec![1.0; n], 0.4, 0.1, 1.0);
         let e0 = sys.total_energy();
@@ -227,16 +227,17 @@ mod tests {
         let mut pos = Vec::new();
         let mut vel = Vec::new();
         for _ in 0..n {
-            pos.push(DVec3::new(rng() * 2.0 - 1.0, rng() * 2.0 - 1.0, rng() * 2.0 - 1.0));
-            vel.push(DVec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 0.2);
+            pos.push(Vec3::new(rng() * 2.0 - 1.0, rng() * 2.0 - 1.0, rng() * 2.0 - 1.0));
+            vel.push(Vec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 0.2);
         }
         let mut sys = Particles::new(pos, vel, vec![1.0; n], 0.0, 0.1, 1.0);
         let p0 = sys.total_momentum();
         for _ in 0..300 {
             sys.step(0.002);
         }
+        // Exactly conserved in real arithmetic; in f32 it holds to rounding.
         assert!(
-            (sys.total_momentum() - p0).length() < 1e-9,
+            (sys.total_momentum() - p0).length() < 1e-4,
             "momentum changed by {}",
             (sys.total_momentum() - p0).length()
         );

@@ -10,6 +10,9 @@ correctness beat cleverness.
 - **Edition** Rust 2021. Keep the project compiling and runnable after every phase.
 - **Precision:** all astronomy/physics in `f64` (`glam::DVec3`/`DMat4`). Convert to
   `f32` only at the GPU boundary, using a camera-centred floating origin.
+  *Exception:* the galaxy-collision mode's N-body compute
+  (`physics::octree`/`particles`/`galaxy_ic`) is `f32` — it is a scale-free *visual*
+  sim, not precision astronomy, and f32 halves the tree's memory footprint.
 - **Units:** AU, days, radians. `k = 0.01720209895`, `GM_sun = k²`,
   `c = 173.144 AU/day`, obliquity `ε = 23.4393°`. Document every constant where defined.
 - **Crate versions:** add `egui-wgpu` first; use the exact `wgpu` version it depends

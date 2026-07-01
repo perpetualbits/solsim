@@ -10,7 +10,7 @@
 //! Everything runs in scale-free units (`G = 1`, disk scale length 1); the camera
 //! just orbits the point cloud, so the absolute scale never matters.
 
-use glam::DVec3;
+use glam::Vec3;
 
 use crate::physics::galaxy_ic::{colliding_pair, GalaxyParams};
 use crate::physics::particles::Particles;
@@ -20,15 +20,15 @@ use crate::render::points::PointInstance;
 /// runs slower per step); 30 000 keeps the collision smooth to watch.
 const N_DISK: usize = 30_000;
 /// Simulation time advanced per step (leapfrog is stable at this size).
-const DT: f64 = 0.05;
+const DT: f32 = 0.05;
 /// Most simulation steps we will run in a single frame (the fast-forward cap).
 const MAX_STEPS_PER_FRAME: u32 = 32;
 /// Barnes–Hut opening angle (bigger = faster, a little rougher).
-const THETA: f64 = 0.6;
+const THETA: f32 = 0.6;
 /// Gravitational softening (a length), so close particles do not blow up.
-const SOFTENING: f64 = 0.05;
+const SOFTENING: f32 = 0.05;
 /// Gravitational constant in these scale-free units.
-const G: f64 = 1.0;
+const G: f32 = 1.0;
 
 /// The running galaxy-collision simulation and how to colour it.
 ///
@@ -59,7 +59,7 @@ impl GalaxyMode {
     /// offset and a tilt on the second disk — the recipe for prominent tidal tails.
     /// Units: scale-free.
     pub fn new() -> Self {
-        let galaxy = |spin: f64| GalaxyParams {
+        let galaxy = |spin: f32| GalaxyParams {
             n_disk: N_DISK,
             central_mass: 4.0,
             disk_mass: 1.0,
@@ -83,7 +83,7 @@ impl GalaxyMode {
     pub fn step(&mut self) {
         for _ in 0..self.steps_per_frame {
             self.sim.step(DT);
-            self.time += DT;
+            self.time += DT as f64;
         }
     }
 
@@ -113,7 +113,7 @@ impl GalaxyMode {
     }
 
     /// The midpoint between the two galaxy centres — a good camera target.
-    pub fn center(&self) -> DVec3 {
+    pub fn center(&self) -> Vec3 {
         (self.sim.pos[0] + self.sim.pos[self.n_a]) * 0.5
     }
 
@@ -126,10 +126,10 @@ impl GalaxyMode {
     /// camera target so they sit around the origin for the renderer.
     /// Units: `center` scale-free; output positions in the renderer's frame, sizes
     /// in pixels, colours linear RGBA.
-    pub fn points(&self, center: DVec3) -> Vec<PointInstance> {
+    pub fn points(&self, center: Vec3) -> Vec<PointInstance> {
         let mut out = Vec::with_capacity(self.sim.len());
         for (i, p) in self.sim.pos.iter().enumerate() {
-            let rel = (*p - center).as_vec3();
+            let rel = *p - center;
             let core = i == 0 || i == self.n_a;
             let (color, size) = if core {
                 ([1.0, 1.0, 0.9, 1.0], 8.0)

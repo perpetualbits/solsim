@@ -12,7 +12,7 @@
 //! own (pick `G = 1` and everything else scales); nothing is drawn yet.
 #![allow(dead_code)]
 
-use glam::DVec3;
+use glam::Vec3;
 
 use crate::rng::Rng;
 
@@ -27,11 +27,11 @@ use crate::rng::Rng;
 /// length unit; `spin` dimensionless (±1).
 pub struct GalaxyParams {
     pub n_disk: usize,
-    pub central_mass: f64,
-    pub disk_mass: f64,
-    pub scale_radius: f64,
-    pub thickness: f64,
-    pub spin: f64,
+    pub central_mass: f32,
+    pub disk_mass: f32,
+    pub scale_radius: f32,
+    pub thickness: f32,
+    pub spin: f32,
 }
 
 /// Build one galaxy centred at the origin and at rest.
@@ -46,10 +46,10 @@ pub struct GalaxyParams {
 /// Principle: circular-orbit balance `G·M(<r)/r² = v²/r` — Kepler/Newton applied
 /// shell by shell.
 /// Units: as [`GalaxyParams`]; `g` the gravitational constant in the caller's units.
-pub fn make_galaxy(p: &GalaxyParams, g: f64, seed: u64) -> (Vec<DVec3>, Vec<DVec3>, Vec<f64>) {
+pub fn make_galaxy(p: &GalaxyParams, g: f32, seed: u64) -> (Vec<Vec3>, Vec<Vec3>, Vec<f32>) {
     let mut rng = Rng::new(seed);
     let m_part = if p.n_disk > 0 {
-        p.disk_mass / p.n_disk as f64
+        p.disk_mass / p.n_disk as f32
     } else {
         0.0
     };
@@ -61,11 +61,11 @@ pub fn make_galaxy(p: &GalaxyParams, g: f64, seed: u64) -> (Vec<DVec3>, Vec<DVec
     let mut height = Vec::with_capacity(p.n_disk);
     for _ in 0..p.n_disk {
         // Gamma(2, r_d) = −r_d·(ln u₁ + ln u₂): an exponential disk.
-        let r = (-p.scale_radius * (rng.unit().max(1e-12).ln() + rng.unit().max(1e-12).ln()))
+        let r = (-p.scale_radius * ((rng.unit() as f32).max(1e-12).ln() + (rng.unit() as f32).max(1e-12).ln()))
             .max(r_min);
         radius.push(r);
-        angle.push(rng.unit() * std::f64::consts::TAU);
-        height.push(p.thickness * rng.gaussian());
+        angle.push((rng.unit() as f32) * std::f32::consts::TAU);
+        height.push(p.thickness * (rng.gaussian() as f32));
     }
 
     // Enclosed disk mass at each particle: sort by radius, count those nearer in.
@@ -73,18 +73,18 @@ pub fn make_galaxy(p: &GalaxyParams, g: f64, seed: u64) -> (Vec<DVec3>, Vec<DVec
     order.sort_by(|&a, &b| radius[a].total_cmp(&radius[b]));
     let mut enclosed = vec![0.0; p.n_disk];
     for (rank, &i) in order.iter().enumerate() {
-        enclosed[i] = p.central_mass + m_part * rank as f64;
+        enclosed[i] = p.central_mass + m_part * rank as f32;
     }
 
-    let mut pos = vec![DVec3::ZERO];
-    let mut vel = vec![DVec3::ZERO];
+    let mut pos = vec![Vec3::ZERO];
+    let mut vel = vec![Vec3::ZERO];
     let mut mass = vec![p.central_mass];
     for i in 0..p.n_disk {
         let (s, c) = angle[i].sin_cos();
-        pos.push(DVec3::new(radius[i] * c, radius[i] * s, height[i]));
+        pos.push(Vec3::new(radius[i] * c, radius[i] * s, height[i]));
         // Circular speed from the enclosed mass; tangential, sense set by `spin`.
         let v_circ = (g * enclosed[i] / radius[i]).sqrt();
-        vel.push(DVec3::new(-s, c, 0.0) * (v_circ * p.spin));
+        vel.push(Vec3::new(-s, c, 0.0) * (v_circ * p.spin));
         mass.push(m_part);
     }
     (pos, vel, mass)
@@ -108,19 +108,19 @@ pub fn make_galaxy(p: &GalaxyParams, g: f64, seed: u64) -> (Vec<DVec3>, Vec<DVec
 pub fn colliding_pair(
     a: &GalaxyParams,
     b: &GalaxyParams,
-    g: f64,
-    separation: f64,
-    approach: f64,
-    impact: f64,
-    inclination_b: f64,
+    g: f32,
+    separation: f32,
+    approach: f32,
+    impact: f32,
+    inclination_b: f32,
     seed: u64,
-) -> (Vec<DVec3>, Vec<DVec3>, Vec<f64>) {
+) -> (Vec<Vec3>, Vec<Vec3>, Vec<f32>) {
     let (mut pa, mut va, ma) = make_galaxy(a, g, seed);
     let (pb, vb, mb) = make_galaxy(b, g, seed ^ 0xABCD_1234);
 
     // Galaxy A: shift left/up, move right.
-    let off_a = DVec3::new(-0.5 * separation, 0.5 * impact, 0.0);
-    let bulk_a = DVec3::new(0.5 * approach, 0.0, 0.0);
+    let off_a = Vec3::new(-0.5 * separation, 0.5 * impact, 0.0);
+    let bulk_a = Vec3::new(0.5 * approach, 0.0, 0.0);
     for p in pa.iter_mut() {
         *p += off_a;
     }
@@ -130,9 +130,9 @@ pub fn colliding_pair(
 
     // Galaxy B: tilt its disk, then shift right/down and move left.
     let (si, ci) = inclination_b.sin_cos();
-    let tilt = |q: DVec3| DVec3::new(q.x, q.y * ci - q.z * si, q.y * si + q.z * ci);
-    let off_b = DVec3::new(0.5 * separation, -0.5 * impact, 0.0);
-    let bulk_b = DVec3::new(-0.5 * approach, 0.0, 0.0);
+    let tilt = |q: Vec3| Vec3::new(q.x, q.y * ci - q.z * si, q.y * si + q.z * ci);
+    let off_b = Vec3::new(0.5 * separation, -0.5 * impact, 0.0);
+    let bulk_b = Vec3::new(-0.5 * approach, 0.0, 0.0);
 
     let mut pos = pa;
     let mut vel = va;
@@ -166,11 +166,11 @@ mod tests {
         let (pos, vel, mass) = make_galaxy(&p, g, 42);
         let r0 = pos[1].length();
         let mut sys = Particles::new(pos, vel, mass, 0.0, 1e-4, g);
-        let period = std::f64::consts::TAU * (r0 * r0 * r0 / (g * 1.0)).sqrt();
+        let period = std::f32::consts::TAU * (r0 * r0 * r0 / (g * 1.0)).sqrt();
         let steps = 2000;
-        let dt = period / steps as f64;
-        let mut min_r = f64::INFINITY;
-        let mut max_r = 0.0_f64;
+        let dt = period / steps as f32;
+        let mut min_r = f32::INFINITY;
+        let mut max_r = 0.0_f32;
         for _ in 0..steps {
             sys.step(dt);
             let r = sys.pos[1].length();
@@ -201,11 +201,11 @@ mod tests {
         let rms = |sys: &Particles| {
             // Cylindrical radius of the disk particles about the central mass.
             let c = sys.pos[0];
-            let sum: f64 = sys.pos[1..]
+            let sum: f32 = sys.pos[1..]
                 .iter()
                 .map(|q| (*q - c).truncate().length_squared())
                 .sum();
-            (sum / (sys.pos.len() - 1) as f64).sqrt()
+            (sum / (sys.pos.len() - 1) as f32).sqrt()
         };
 
         let mut sys = Particles::new(pos, vel, mass, 0.5, 0.05, g);
@@ -225,7 +225,7 @@ mod tests {
     /// intended offsets.
     #[test]
     fn colliding_pair_is_assembled() {
-        let mk = |spin: f64| GalaxyParams {
+        let mk = |spin: f32| GalaxyParams {
             n_disk: 100,
             central_mass: 3.0,
             disk_mass: 1.0,
@@ -239,15 +239,15 @@ mod tests {
         assert_eq!(vel.len(), pos.len());
         assert_eq!(mass.len(), pos.len());
         // Central masses are the first particle of each galaxy.
-        assert!((pos[0] - DVec3::new(-4.0, 0.75, 0.0)).length() < 1e-9);
-        assert!((pos[101] - DVec3::new(4.0, -0.75, 0.0)).length() < 1e-9);
+        assert!((pos[0] - Vec3::new(-4.0, 0.75, 0.0)).length() < 1e-9);
+        assert!((pos[101] - Vec3::new(4.0, -0.75, 0.0)).length() < 1e-9);
     }
 
     /// A colliding pair, stepped through the Barnes–Hut leapfrog, must stay finite
     /// (the full galaxy-mode dynamics path, minus the graphics).
     #[test]
     fn colliding_pair_stays_finite() {
-        let mk = |spin: f64| GalaxyParams {
+        let mk = |spin: f32| GalaxyParams {
             n_disk: 200,
             central_mass: 4.0,
             disk_mass: 1.0,

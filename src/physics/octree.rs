@@ -18,13 +18,18 @@
 //! chasing pointers, and the per-body walks are independent, so they run in
 //! parallel (see [`Octree::accelerations`]).
 //!
-//! Everything is in `f64`. Units are left to the caller (pass your own `G`); the
-//! forces are softened (a small `ε`) so two bodies that come very close do not fly
-//! apart from a division by nearly zero — the right thing for a *smooth* galaxy
-//! made of sample particles. Validated by its tests against the direct O(N²) sum.
+//! Everything here is in **`f32`** — a deliberate exception to the project's
+//! f64 rule, scoped to the galaxy mode: this is a *scale-free, visual* simulation
+//! (not precision astronomy), where f32's ~7 digits are ample and halving the node
+//! size makes the tree friendlier to the cache. The solar system stays f64.
+//!
+//! Units are left to the caller (pass your own `G`); the forces are softened (a
+//! small `ε`) so two bodies that come very close do not fly apart from a division
+//! by nearly zero — the right thing for a *smooth* galaxy made of sample particles.
+//! Validated by its tests against the direct O(N²) sum.
 #![allow(dead_code)]
 
-use glam::DVec3;
+use glam::Vec3;
 
 /// Deepest the tree may subdivide before it just buckets bodies together.
 ///
@@ -47,10 +52,10 @@ const MAX_DEPTH: u32 = 64;
 /// it is then flattened into the fast [`FlatNode`] array and discarded.
 /// Units: caller's own.
 struct Node {
-    center: DVec3,
-    half: f64,
-    com: DVec3,
-    mass: f64,
+    center: Vec3,
+    half: f32,
+    com: Vec3,
+    mass: f32,
     children: [i32; 8],
     body: i32,
     extra: Vec<u32>,
@@ -58,11 +63,11 @@ struct Node {
 }
 
 impl Node {
-    fn empty(center: DVec3, half: f64) -> Self {
+    fn empty(center: Vec3, half: f32) -> Self {
         Node {
             center,
             half,
-            com: DVec3::ZERO,
+            com: Vec3::ZERO,
             mass: 0.0,
             children: [-1; 8],
             body: -1,
@@ -86,7 +91,7 @@ impl Builder {
     /// both bodies down, an internal cell forwards it to the right child. At the
     /// depth cap coincident bodies just share the leaf.
     /// Units: caller's own.
-    fn insert(&mut self, node: usize, body: usize, depth: u32, pos: &[DVec3], mass: &[f64]) {
+    fn insert(&mut self, node: usize, body: usize, depth: u32, pos: &[Vec3], mass: &[f32]) {
         {
             let n = &mut self.nodes[node];
             let bm = mass[body];
@@ -119,7 +124,7 @@ impl Builder {
     }
 
     /// Forward a body into the correct child cube, creating it if new.
-    fn insert_into_child(&mut self, parent: usize, body: usize, depth: u32, pos: &[DVec3], mass: &[f64]) {
+    fn insert_into_child(&mut self, parent: usize, body: usize, depth: u32, pos: &[Vec3], mass: &[f32]) {
         let (center, half) = {
             let n = &self.nodes[parent];
             (n.center, n.half)
@@ -152,9 +157,9 @@ impl Builder {
 /// Units: caller's own; `size2` a length².
 #[derive(Clone, Copy)]
 struct FlatNode {
-    com: DVec3,
-    mass: f64,
-    size2: f64,
+    com: Vec3,
+    mass: f32,
+    size2: f32,
     skip: u32,
     body_start: u32,
     body_count: u32,
@@ -168,8 +173,8 @@ struct FlatNode {
 pub struct Octree {
     flat: Vec<FlatNode>,
     leaf_bodies: Vec<u32>,
-    theta2: f64,
-    softening2: f64,
+    theta2: f32,
+    softening2: f32,
 }
 
 impl Octree {
@@ -181,7 +186,7 @@ impl Octree {
     /// into the depth-first array walked by [`acceleration`](Self::acceleration).
     /// Units: `pos`/`mass` in the caller's units; `theta` dimensionless (smaller =
     /// more accurate, slower); `softening` a length.
-    pub fn build(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64) -> Octree {
+    pub fn build(pos: &[Vec3], mass: &[f32], theta: f32, softening: f32) -> Octree {
         let mut tree = Octree {
             flat: Vec::new(),
             leaf_bodies: Vec::new(),
@@ -192,8 +197,8 @@ impl Octree {
             return tree;
         }
         // Bounding cube.
-        let mut lo = DVec3::splat(f64::INFINITY);
-        let mut hi = DVec3::splat(f64::NEG_INFINITY);
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
         for p in pos {
             lo = lo.min(*p);
             hi = hi.max(*p);
@@ -226,9 +231,9 @@ impl Octree {
     /// of mass.
     /// Units: `pos`/`mass` as [`build`](Self::build); `g` the gravitational constant;
     /// returns an acceleration in those units.
-    pub fn acceleration(&self, i: usize, pos: &[DVec3], mass: &[f64], g: f64) -> DVec3 {
+    pub fn acceleration(&self, i: usize, pos: &[Vec3], mass: &[f32], g: f32) -> Vec3 {
         let pi = pos[i];
-        let mut acc = DVec3::ZERO;
+        let mut acc = Vec3::ZERO;
         let mut idx = 0usize;
         let count = self.flat.len();
         while idx < count {
@@ -269,7 +274,7 @@ impl Octree {
     /// deterministic as) a sequential run — the tests that check it against the
     /// direct sum therefore also check the parallel path.
     /// Units: as [`build`](Self::build) / [`acceleration`](Self::acceleration).
-    pub fn accelerations(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64, g: f64) -> Vec<DVec3> {
+    pub fn accelerations(pos: &[Vec3], mass: &[f32], theta: f32, softening: f32, g: f32) -> Vec<Vec3> {
         use rayon::prelude::*;
         let tree = Octree::build(pos, mass, theta, softening);
         (0..pos.len())
@@ -323,26 +328,26 @@ fn flatten(nodes: &[Node], ni: usize, flat: &mut Vec<FlatNode>, leaf_bodies: &mu
 /// How/why: the softened inverse-square law; the `ε²` keeps the force finite when
 /// two sample particles nearly coincide.
 /// Units: caller's own; `soft2 = ε²`.
-fn add_pull(src: DVec3, m: f64, dst: DVec3, soft2: f64, acc: &mut DVec3) {
+fn add_pull(src: Vec3, m: f32, dst: Vec3, soft2: f32, acc: &mut Vec3) {
     let d = src - dst;
     let soft = d.length_squared() + soft2;
     *acc += m * d / (soft * soft.sqrt());
 }
 
 /// Which of the eight octants of a cube a point falls into (x = bit 0, …).
-fn octant(center: DVec3, p: DVec3) -> usize {
+fn octant(center: Vec3, p: Vec3) -> usize {
     (p.x >= center.x) as usize
         | (((p.y >= center.y) as usize) << 1)
         | (((p.z >= center.z) as usize) << 2)
 }
 
 /// The centre and half-width of child octant `oct` of a cube.
-fn child_box(center: DVec3, half: f64, oct: usize) -> (DVec3, f64) {
+fn child_box(center: Vec3, half: f32, oct: usize) -> (Vec3, f32) {
     let h = half * 0.5;
     let dx = if oct & 1 != 0 { h } else { -h };
     let dy = if oct & 2 != 0 { h } else { -h };
     let dz = if oct & 4 != 0 { h } else { -h };
-    (center + DVec3::new(dx, dy, dz), h)
+    (center + Vec3::new(dx, dy, dz), h)
 }
 
 #[cfg(test)]
@@ -352,23 +357,23 @@ mod tests {
     /// A tiny deterministic RNG (SplitMix64) for reproducible test clouds.
     struct Rng(u64);
     impl Rng {
-        fn next(&mut self) -> f64 {
+        fn next(&mut self) -> f32 {
             self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
-            (z >> 11) as f64 / (1u64 << 53) as f64
+            (z >> 11) as f32 / (1u64 << 53) as f32
         }
     }
 
     /// Build a random cloud of `n` bodies in the cube [-1,1]³ with masses 0.5..1.5.
-    fn cloud(n: usize) -> (Vec<DVec3>, Vec<f64>) {
+    fn cloud(n: usize) -> (Vec<Vec3>, Vec<f32>) {
         let mut rng = Rng(0xDEAD_BEEF_1234_5678);
         let mut pos = Vec::with_capacity(n);
         let mut mass = Vec::with_capacity(n);
         for _ in 0..n {
-            pos.push(DVec3::new(
+            pos.push(Vec3::new(
                 2.0 * rng.next() - 1.0,
                 2.0 * rng.next() - 1.0,
                 2.0 * rng.next() - 1.0,
@@ -379,8 +384,8 @@ mod tests {
     }
 
     /// The exact O(N²) softened acceleration on body `i`, for checking the tree.
-    fn direct(i: usize, pos: &[DVec3], mass: &[f64], soft2: f64) -> DVec3 {
-        let mut a = DVec3::ZERO;
+    fn direct(i: usize, pos: &[Vec3], mass: &[f32], soft2: f32) -> Vec3 {
+        let mut a = Vec3::ZERO;
         for (j, &pj) in pos.iter().enumerate() {
             if j == i {
                 continue;
@@ -400,8 +405,10 @@ mod tests {
         let bh = Octree::accelerations(&pos, &mass, 0.0, soft, 1.0);
         for i in 0..pos.len() {
             let d = direct(i, &pos, &mass, soft * soft);
+            // Same physical sum, but the tree adds it in a different order, so in
+            // f32 they agree only to f32 rounding (not bit-for-bit).
             assert!(
-                (bh[i] - d).length() <= 1e-9 * d.length().max(1e-9),
+                (bh[i] - d).length() <= 3e-3 * d.length().max(1e-6),
                 "body {i}: tree {:?} vs direct {:?}",
                 bh[i],
                 d
@@ -416,14 +423,14 @@ mod tests {
         let soft = 0.02;
         let bh = Octree::accelerations(&pos, &mass, 0.5, soft, 1.0);
         let mut sum_rel = 0.0;
-        let mut worst: f64 = 0.0;
+        let mut worst: f32 = 0.0;
         for i in 0..pos.len() {
             let d = direct(i, &pos, &mass, soft * soft);
             let rel = (bh[i] - d).length() / d.length().max(1e-12);
             sum_rel += rel;
             worst = worst.max(rel);
         }
-        let mean = sum_rel / pos.len() as f64;
+        let mean = sum_rel / pos.len() as f32;
         assert!(mean < 0.01, "mean relative error {mean} too high");
         assert!(worst < 0.1, "worst relative error {worst} too high");
     }
@@ -433,15 +440,15 @@ mod tests {
     fn smaller_theta_is_more_accurate() {
         let (pos, mass) = cloud(800);
         let soft = 0.02;
-        let err = |theta: f64| {
+        let err = |theta: f32| {
             let bh = Octree::accelerations(&pos, &mass, theta, soft, 1.0);
             (0..pos.len())
                 .map(|i| {
                     let d = direct(i, &pos, &mass, soft * soft);
                     (bh[i] - d).length() / d.length().max(1e-12)
                 })
-                .sum::<f64>()
-                / pos.len() as f64
+                .sum::<f32>()
+                / pos.len() as f32
         };
         assert!(err(0.2) <= err(0.8), "tighter theta should not be worse");
     }
@@ -449,10 +456,10 @@ mod tests {
     /// A lone body feels no force, and coincident bodies stay finite.
     #[test]
     fn degenerate_cases_are_safe() {
-        let one = Octree::accelerations(&[DVec3::new(1.0, 2.0, 3.0)], &[1.0], 0.5, 0.1, 1.0);
+        let one = Octree::accelerations(&[Vec3::new(1.0, 2.0, 3.0)], &[1.0], 0.5, 0.1, 1.0);
         assert!(one[0].length() < 1e-12, "a single body feels no force");
 
-        let same = vec![DVec3::ZERO; 5];
+        let same = vec![Vec3::ZERO; 5];
         let masses = vec![1.0; 5];
         let acc = Octree::accelerations(&same, &masses, 0.5, 0.1, 1.0);
         for a in acc {
