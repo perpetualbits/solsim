@@ -1548,6 +1548,23 @@ fn map_u32(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<u32> {
     bytemuck::cast_slice::<u8, u32>(&data)[..n].to_vec()
 }
 
+/// Map a readback buffer and copy out `n` `u64`s (blocks until the GPU is done).
+///
+/// Used for timestamp-query results (each timestamp is a 64-bit GPU tick count).
+#[cfg(test)]
+fn map_u64(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<u64> {
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .unwrap();
+    let data = slice.get_mapped_range();
+    bytemuck::cast_slice::<u8, u64>(&data)[..n].to_vec()
+}
+
 /// Map a readback buffer and copy out `n` `f32`s (blocks until the GPU is done).
 fn map_f32(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<f32> {
     let slice = buf.slice(..);
@@ -1608,9 +1625,11 @@ pub fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         force_fallback_adapter: false,
     }))
     .ok()?;
-    // Ask for subgroup ops if the adapter has them — the cooperative tree walk uses
-    // `subgroupAny`. Falls back cleanly to the scalar walk when absent.
-    let want = wgpu::Features::SUBGROUP & adapter.features();
+    // Ask for subgroup ops (the cooperative walk uses `subgroupAny`) and timestamp
+    // queries (real per-stage profiling) where the adapter has them. Both degrade
+    // gracefully: the scalar walk, and the CPU-timed profiler, respectively.
+    let want =
+        (wgpu::Features::SUBGROUP | wgpu::Features::TIMESTAMP_QUERY) & adapter.features();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("nbody compute device"),
         required_features: want,
@@ -2508,6 +2527,130 @@ impl GpuNBody {
         out.push(bench("full-forces", &mut |e| self.encode_forces(e)));
         out
     }
+
+    /// True per-stage timing from GPU **timestamp queries** (test/diagnostic only).
+    ///
+    /// Returns `(stage_name, milliseconds)` averaged over `iters`, or `None` if the
+    /// device lacks `TIMESTAMP_QUERY`. Unlike [`profile`](Self::profile), this records
+    /// the GPU clock at each stage boundary *inside one real forces submission*, so the
+    /// numbers reflect the fused pipeline — passes overlapping, caches warm from the
+    /// previous stage — not each stage run cold and alone.
+    #[cfg(test)]
+    pub(crate) fn profile_timed(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        iters: usize,
+    ) -> Option<Vec<(&'static str, f64)>> {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        // One timestamp at the pipeline start, then one at the end of each stage.
+        let labels = [
+            "bbox", "morton", "setup", "radix", "gather", "seed", "lbvh", "refit", "size",
+            "traverse", "scatter",
+        ];
+        let nstage = labels.len();
+        let nts = nstage + 1;
+        let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("profile timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: nts as u32,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts resolve"),
+            size: (nts * 8) as u64,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = readback_buffer(device, (nts * 8) as u64);
+
+        let gn = (self.n as u32).div_ceil(64);
+        let gtot = ((2 * self.n - 1) as u32).div_ceil(64);
+        let gm = (self.n.next_power_of_two() as u32).div_ceil(64);
+        let tiles = self.num_tiles;
+        let period = queue.get_timestamp_period() as f64; // nanoseconds per tick
+
+        // Encode one dispatch, optionally writing the start/end-of-pass timestamps.
+        fn disp(
+            enc: &mut wgpu::CommandEncoder,
+            qset: &wgpu::QuerySet,
+            pipe: &wgpu::ComputePipeline,
+            bg: &wgpu::BindGroup,
+            groups: u32,
+            begin: Option<u32>,
+            end: Option<u32>,
+        ) {
+            let tw = if begin.is_some() || end.is_some() {
+                Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qset,
+                    beginning_of_pass_write_index: begin,
+                    end_of_pass_write_index: end,
+                })
+            } else {
+                None
+            };
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: tw,
+            });
+            p.set_pipeline(pipe);
+            p.set_bind_group(0, bg, &[]);
+            p.dispatch_workgroups(groups, 1, 1);
+        }
+
+        let mut acc = vec![0.0f64; nstage];
+        // Warm up (build the tree once) so the first timed run isn't cold.
+        self.recompute_forces(device, queue);
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .unwrap();
+
+        for _ in 0..iters {
+            let mut e =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            // Stage 0 (bbox) also opens the pipeline timer at index 0.
+            disp(&mut e, &qset, &self.p_bbox, &self.b_bbox, 1, Some(0), Some(1));
+            disp(&mut e, &qset, &self.p_morton, &self.b_morton, gn, None, Some(2));
+            disp(&mut e, &qset, &self.p_setup, &self.b_setup, gm, None, Some(3));
+            for p in 0..4usize {
+                disp(&mut e, &qset, &self.p_rhist, &self.b_rhist[p], tiles, None, None);
+                disp(&mut e, &qset, &self.p_rscan, &self.b_rscan[p], 1, None, None);
+                // Last radix pass closes the "radix" stage (index 4).
+                let end = if p == 3 { Some(4) } else { None };
+                disp(&mut e, &qset, &self.p_rscatter, &self.b_rscatter[p], tiles, None, end);
+            }
+            disp(&mut e, &qset, &self.p_gather, &self.b_gather, gn, None, Some(5));
+            disp(&mut e, &qset, &self.p_seed, &self.b_seed, gtot, None, Some(6));
+            disp(&mut e, &qset, &self.p_lbvh, &self.b_lbvh, gn, None, Some(7));
+            for i in 0..REFIT_PASSES {
+                let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
+                let end = if i == REFIT_PASSES - 1 { Some(8) } else { None };
+                disp(&mut e, &qset, &self.p_agg, bg, gtot, None, end);
+            }
+            disp(&mut e, &qset, &self.p_size, &self.b_size, gtot, None, Some(9));
+            disp(&mut e, &qset, &self.p_trav, &self.b_trav, gn, None, Some(10));
+            disp(&mut e, &qset, &self.p_scatter, &self.b_scatter, gn, None, Some(11));
+
+            e.resolve_query_set(&qset, 0..nts as u32, &resolve, 0);
+            e.copy_buffer_to_buffer(&resolve, 0, &read, 0, (nts * 8) as u64);
+            queue.submit(Some(e.finish()));
+
+            let ticks = map_u64(device, &read, nts);
+            read.unmap();
+            for i in 0..nstage {
+                let dt = ticks[i + 1].saturating_sub(ticks[i]) as f64 * period / 1e6; // → ms
+                acc[i] += dt;
+            }
+        }
+        Some(
+            labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (*l, acc[i] / iters as f64))
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3012,9 +3155,18 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.6f32);
         let sim = GpuNBody::new(&device, &queue, &pos, &vel, &mass, theta, 0.05, 1.0);
-        for row in sim.profile(&device, &queue, 30) {
-            println!("{:>14}  {:6.3} ms", row.0, row.1);
+        // Prefer real GPU timestamps; fall back to CPU-timed isolated stages.
+        let (rows, source) = match sim.profile_timed(&device, &queue, 50) {
+            Some(rows) => (rows, "GPU timestamps, fused pipeline"),
+            None => (sim.profile(&device, &queue, 30), "CPU-timed, isolated stages"),
+        };
+        println!("--- per-stage timing ({source}) ---");
+        let mut total = 0.0;
+        for (name, ms) in &rows {
+            println!("{name:>14}  {ms:7.3} ms");
+            total += ms;
         }
+        println!("{:>14}  {total:7.3} ms", "TOTAL");
     }
 
     /// At galaxy scale the resident stepper must stay finite and bounded.

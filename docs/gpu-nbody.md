@@ -542,6 +542,20 @@ Bandwidth in the tree walk, not cleverness, is the limit at the top end. The def
 galaxy is **~200k bodies** — a smooth ~40 fps that stays watchable through the
 collision — and `[` / `]` trade accuracy for speed if you push the count higher.
 
+### A word on measuring: isolated benchmarks lie a little
+
+The first profiler timed each stage by submitting it *alone* in a loop — quick to
+write, but it runs every stage cold-and-solo, so the numbers don't add up to the real
+step. The honest tool is **GPU timestamp queries** (`profile_timed`, needing the
+`TIMESTAMP_QUERY` feature): it records the GPU clock at each stage boundary *inside one
+real forces submission*, so the stages tile the step exactly (each is `ts[i+1] − ts[i]`)
+and sum to the true total. Doing that at a million bodies confirmed the shape —
+traverse ~80 ms, radix ~19, everything else small — but corrected one thing the
+isolated timer had flattered: the **refit is ~12 ms, not ~8**. On its own it re-ran on
+a warm cache; in the real pipeline it competes for bandwidth with everything around it.
+The lesson is a general one: micro-benchmarks measured out of context mislead — profile
+in situ.
+
 ---
 
 Every phase landed as its own kernel with its own CPU-reference test, so the whole GPU
