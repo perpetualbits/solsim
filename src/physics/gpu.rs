@@ -857,6 +857,69 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Warp-cooperative version of [`TRAVERSE_SHADER`] (same bindings, needs subgroups).
+///
+/// The particles are Morton-sorted, so the lanes of a subgroup are neighbours in
+/// space and want to open nearly the same nodes. Instead of each lane walking its own
+/// stack (and the warp stalling on its most-divergent lane), the whole subgroup walks
+/// **one** node at a time: a node is opened if `subgroupAny` says *any* lane still
+/// needs it, otherwise every lane lumps it. Because that decision is subgroup-uniform,
+/// every lane makes identical push/pop moves, so their private stacks stay identical —
+/// no shared memory needed, and the control flow never diverges. Each lane still sums
+/// the pull for its *own* particle. Out-of-range tail lanes stay in the loop (voting
+/// "don't open") so the subgroup control flow remains uniform for `subgroupAny`.
+const TRAVERSE_COOP_SHADER: &str = r#"
+struct Uni { n: u32, theta2: f32, soft2: f32, g: f32 };
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var<storage, read> node_com: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> node_size2: array<f32>;
+@group(0) @binding(3) var<storage, read> lft: array<u32>;
+@group(0) @binding(4) var<storage, read> rgt: array<u32>;
+@group(0) @binding(5) var<storage, read_write> out_acc: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    let live = k < u.n;
+    let leaf_base = u.n - 1u;
+    // Inactive tail lanes clamp to a valid node so their reads are safe; they never
+    // vote to open and never write out, so they cannot affect the result.
+    let my_leaf = select(leaf_base, leaf_base + k, live);
+    let pi = node_com[my_leaf].xyz;
+
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    var stack: array<u32, 64>;                 // private, but identical across the subgroup
+    var sp = 1u;
+    stack[0] = 0u;
+
+    loop {
+        if (sp == 0u) { break; }
+        sp = sp - 1u;
+        let node = stack[sp];                  // uniform across the subgroup
+        let cm = node_com[node];
+        let d = cm.xyz - pi;
+        let r2 = dot(d, d);
+
+        if (node >= leaf_base) {
+            let soft = r2 + u.soft2;
+            if (live) { acc = acc + cm.w * d / (soft * sqrt(soft)); }
+        } else {
+            let need_open = live && (node_size2[node] >= u.theta2 * r2);
+            if (subgroupAny(need_open)) {      // any lane too close → all open
+                if (sp <= 62u) {
+                    stack[sp] = lft[node]; sp = sp + 1u;
+                    stack[sp] = rgt[node]; sp = sp + 1u;
+                }
+            } else {                           // all far → all lump
+                let soft = r2 + u.soft2;
+                if (live) { acc = acc + cm.w * d / (soft * sqrt(soft)); }
+            }
+        }
+    }
+    if (live) { out_acc[k] = vec4<f32>(acc * u.g, 0.0); }
+}
+"#;
+
 /// Barnes–Hut accelerations for every particle, entirely on the GPU.
 ///
 /// What: runs the whole pipeline — bounding box, Morton codes, sort, LBVH build,
@@ -1283,8 +1346,12 @@ pub fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         force_fallback_adapter: false,
     }))
     .ok()?;
+    // Ask for subgroup ops if the adapter has them — the cooperative tree walk uses
+    // `subgroupAny`. Falls back cleanly to the scalar walk when absent.
+    let want = wgpu::Features::SUBGROUP & adapter.features();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("nbody compute device"),
+        required_features: want,
         ..Default::default()
     }))
     .ok()?;
@@ -1869,8 +1936,14 @@ impl GpuNBody {
         );
         let b_size = bind(&l_size, &[&uni_n, &node_lo, &node_hi, &node_size2], "size");
 
+        // Use the warp-cooperative walk where subgroups are available (same bindings).
+        let trav_src = if device.features().contains(wgpu::Features::SUBGROUP) {
+            TRAVERSE_COOP_SHADER
+        } else {
+            TRAVERSE_SHADER
+        };
         let (p_trav, l_trav) = mk(
-            TRAVERSE_SHADER,
+            trav_src,
             &[
                 uniform_entry(0),
                 storage_entry(1, true),

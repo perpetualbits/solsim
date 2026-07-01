@@ -259,9 +259,13 @@ impl Gpu {
         let info = adapter.get_info();
         println!("GPU: {} [{:?}, {:?}]", info.name, info.device_type, info.backend);
 
+        // Request subgroup ops if available — the galaxy tree walk uses them for a
+        // warp-cooperative traversal (a large speedup); it falls back automatically.
+        let want = wgpu::Features::SUBGROUP & adapter.features();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("solarsim device"),
+                required_features: want,
                 ..Default::default()
             }))?;
 

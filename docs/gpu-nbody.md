@@ -447,16 +447,38 @@ tests green — just less memory traffic. The result:
 
 A 2.7× win from moving bytes, not flops — exactly what "memory-bound" predicted.
 
-**Where the remaining time goes, and the next lever.** The walk is still ~90 % of the
-step and still memory/divergence-bound. The big structural win left is
-**warp-cooperative traversal**: because the particles are Morton-sorted, the 32 threads
-of a warp are neighbours in space and want to open almost the same nodes, yet today
-each walks its own stack and the warp waits for its most-divergent lane. Having the
-warp share one stack and open a node if *any* lane needs it removes that divergence —
-typically another 2–4× — at the cost of a more intricate kernel (subgroup ballots).
-The cheap knob in the meantime is the opening angle θ: raising it lumps more and visits
-fewer nodes (faster, slightly rougher), which for a *visual* simulation is often a fine
-trade.
+### Warp-cooperative traversal — killing the divergence
+
+That still left the walk memory- *and divergence*-bound. Here is the divergence: a
+warp is 32 threads running in lockstep on one instruction stream. When each thread
+walks its *own* stack, thread A might open a node that thread B would lump — so the
+warp has to execute *both* paths, masking off the threads that don't take each one.
+The warp only runs as fast as the union of all 32 threads' paths.
+
+But we sorted the particles along the Morton curve, so the 32 threads of a warp are
+**neighbours in space** — they want to open almost exactly the same nodes. So let the
+whole warp walk **one shared traversal**: at each node, ask `subgroupAny` whether *any*
+lane still needs to open it; if so everyone opens it, otherwise everyone lumps it. That
+one vote is subgroup-uniform, so every lane makes identical push/pop moves — which
+means their private stacks stay identical with no shared memory, and **the control flow
+never diverges**. Each lane still accumulates the pull on its *own* particle. The only
+cost is that a lane occasionally descends into a node it would have lumped alone; because
+warp-neighbours are spatially coherent, that waste is small and the divergence saving
+dwarfs it. (Out-of-range tail lanes stay in the loop voting "don't open", so the vote
+stays uniform.) It needs the GPU's subgroup feature; without it we fall back to the
+per-lane walk automatically.
+
+```
+       traverse  25.2 ms  →  12.8 ms     (another 2×)
+   full-forces   28.7 ms  →  18.6 ms
+```
+
+**Tally.** The tree walk went 68.7 → 25.2 → 12.8 ms — **5.4× overall** — and a full
+force step 71.7 → 18.6 ms, all with the same tree and no loss of accuracy (the θ = 0
+resident test still matches the CPU leapfrog exactly). The walk is now closer to
+compute-bound; the remaining cheap knob is the opening angle θ (raising it lumps more
+and visits fewer nodes — faster, slightly rougher, fine for a visual sim), and the sort
+and refit are now a visible slice worth revisiting if more is needed.
 
 ---
 
