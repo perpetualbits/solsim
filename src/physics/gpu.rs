@@ -366,6 +366,196 @@ pub fn bitonic_sort_gpu(
     (sorted_keys, sorted_vals)
 }
 
+/// The WGSL LBVH structure kernel (Karras 2012): one thread per internal node.
+///
+/// Node ids: internal nodes `0..n-1`, leaves `n-1..2n-1` (leaf `k` is id `n-1+k`);
+/// the root is internal node 0. Each internal node finds the range of sorted
+/// particles it covers and its split point from `δ` — the length of the common bit
+/// prefix of neighbouring codes (with the array *index* as tiebreaker for equal
+/// codes, which is why the sort ordered by `(code, index)`).
+const LBVH_SHADER: &str = r#"
+struct Uni { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var<storage, read> codes: array<u32>;
+@group(0) @binding(2) var<storage, read_write> lft: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgt: array<u32>;
+@group(0) @binding(4) var<storage, read_write> par: array<u32>;
+
+// Length of the common prefix of the keys at positions i and j (−1 if j is off the
+// end). Equal codes fall back to the indices, so every pair has a definite order.
+fn delta(i: i32, j: i32, n: i32) -> i32 {
+    if (j < 0 || j >= n) { return -1; }
+    let a = codes[u32(i)];
+    let b = codes[u32(j)];
+    if (a == b) {
+        return 32 + i32(countLeadingZeros(u32(i) ^ u32(j)));
+    }
+    return i32(countLeadingZeros(a ^ b));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = i32(u.n);
+    let i = i32(gid.x);
+    if (i >= n - 1) { return; }
+
+    // Direction of the range: toward whichever neighbour shares a longer prefix.
+    let dr = delta(i, i + 1, n);
+    let dl = delta(i, i - 1, n);
+    var d = 1;
+    if (dr < dl) { d = -1; }
+    let delta_min = delta(i, i - d, n);
+
+    // Grow an upper bound on the range length, then binary-search the exact length.
+    var l_max = 2;
+    while (delta(i, i + l_max * d, n) > delta_min) { l_max = l_max * 2; }
+    var l = 0;
+    var t = l_max / 2;
+    while (t >= 1) {
+        if (delta(i, i + (l + t) * d, n) > delta_min) { l = l + t; }
+        t = t / 2;
+    }
+    let j = i + l * d;
+    let delta_node = delta(i, j, n);
+
+    // Binary-search the split position within the range.
+    var s = 0;
+    var dv = 2;
+    loop {
+        let tt = (l + dv - 1) / dv;               // ceil(l / dv)
+        if (delta(i, i + (s + tt) * d, n) > delta_node) { s = s + tt; }
+        if (tt <= 1) { break; }
+        dv = dv * 2;
+    }
+    let gamma = i + s * d + min(d, 0);
+
+    let first = min(i, j);
+    let last = max(i, j);
+    // A child is a leaf when its side of the split is a single element.
+    var lc = u32(gamma);
+    if (gamma == first) { lc = u32(n - 1 + gamma); }
+    var rc = u32(gamma + 1);
+    if (gamma + 1 == last) { rc = u32(n - 1 + gamma + 1); }
+
+    lft[u32(i)] = lc;
+    rgt[u32(i)] = rc;
+    par[lc] = u32(i);
+    par[rc] = u32(i);
+}
+"#;
+
+/// Sentinel "no node" value (the root's parent).
+pub const NO_NODE: u32 = 0xFFFF_FFFF;
+
+/// Build the LBVH structure on the GPU from sorted Morton codes.
+///
+/// What: returns `(left, right, parent)` — for each of the `n-1` internal nodes its
+/// two child ids, and for all `2n-1` nodes its parent (the root's is [`NO_NODE`]).
+/// How/why: runs the Karras kernel, one thread per internal node, then reads the
+/// three arrays back. Node ids: internal `0..n-1`, leaves `n-1..2n-1`.
+/// Units: none (indices).
+pub fn build_lbvh_structure_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    codes: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let n = codes.len();
+    assert!(n >= 2, "need at least two particles");
+    let internal = n - 1;
+    let total = 2 * n - 1;
+
+    let uni = [n as u32, 0, 0, 0];
+    let uni_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lbvh uni"),
+        contents: bytemuck::cast_slice(&uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let codes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lbvh codes"),
+        contents: bytemuck::cast_slice(codes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let rw = |bytes: u64, label| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let left_buf = rw((internal * 4) as u64, "lbvh left");
+    let right_buf = rw((internal * 4) as u64, "lbvh right");
+    // Parent starts all-sentinel; every node but the root gets one written.
+    let parent_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lbvh parent"),
+        contents: bytemuck::cast_slice(&vec![NO_NODE; total]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("lbvh"),
+        source: wgpu::ShaderSource::Wgsl(LBVH_SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lbvh layout"),
+        entries: &[
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, false),
+            storage_entry(4, false),
+        ],
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lbvh bind"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: codes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: left_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: right_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: parent_buf.as_entire_binding() },
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lbvh pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("lbvh pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("lbvh"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((internal as u32).div_ceil(64), 1, 1);
+    }
+    let lback = readback_buffer(device, (internal * 4) as u64);
+    let rback = readback_buffer(device, (internal * 4) as u64);
+    let pback = readback_buffer(device, (total * 4) as u64);
+    encoder.copy_buffer_to_buffer(&left_buf, 0, &lback, 0, (internal * 4) as u64);
+    encoder.copy_buffer_to_buffer(&right_buf, 0, &rback, 0, (internal * 4) as u64);
+    encoder.copy_buffer_to_buffer(&parent_buf, 0, &pback, 0, (total * 4) as u64);
+    queue.submit(Some(encoder.finish()));
+
+    let left = map_u32(device, &lback, internal);
+    let right = map_u32(device, &rback, internal);
+    let parent = map_u32(device, &pback, total);
+    (left, right, parent)
+}
+
 /// A `MAP_READ` buffer of `bytes` bytes.
 fn readback_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -509,6 +699,55 @@ mod tests {
         let (gk, gv) = bitonic_sort_gpu(&device, &queue, &keys, &vals);
         assert_eq!(ck, gk, "sorted keys differ from CPU");
         assert_eq!(cv, gv, "sorted order (payload) differs from CPU");
+    }
+
+    /// The GPU LBVH must be a correct binary radix tree over the sorted codes.
+    ///
+    /// Codes are drawn from a small range so there are many duplicates — which
+    /// forces the δ index-tiebreak path in the Karras build. We then check, on the
+    /// read-back structure, that a left-to-right walk from the root visits leaves
+    /// 0,1,…,N-1 in order (a valid tree covering every particle exactly once) and
+    /// that every child points back to its parent.
+    #[test]
+    fn gpu_lbvh_is_a_valid_tree() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x0BAD_F00D_1234_5678);
+        let n = 3000usize;
+        let mut codes: Vec<u32> = (0..n).map(|_| (rng.unit() * 2000.0) as u32).collect();
+        codes.sort(); // sorted, with many ties
+
+        let (left, right, parent) = build_lbvh_structure_gpu(&device, &queue, &codes);
+        assert_eq!(left.len(), n - 1);
+        assert_eq!(right.len(), n - 1);
+        assert_eq!(parent.len(), 2 * n - 1);
+
+        // Root's parent is the sentinel; children point back at their parents.
+        assert_eq!(parent[0], NO_NODE, "root should have no parent");
+        for i in 0..(n - 1) {
+            assert_eq!(parent[left[i] as usize], i as u32, "left child of {i}");
+            assert_eq!(parent[right[i] as usize], i as u32, "right child of {i}");
+        }
+
+        // Left-to-right leaf walk from the root must be 0,1,…,N-1.
+        let leaf_base = (n - 1) as u32;
+        let mut leaves = Vec::with_capacity(n);
+        let mut stack = vec![0u32];
+        let mut guard = 0;
+        while let Some(node) = stack.pop() {
+            guard += 1;
+            assert!(guard <= 4 * n, "traversal did not terminate (malformed tree)");
+            if node >= leaf_base {
+                leaves.push(node - leaf_base);
+            } else {
+                stack.push(right[node as usize]);
+                stack.push(left[node as usize]);
+            }
+        }
+        let expected: Vec<u32> = (0..n as u32).collect();
+        assert_eq!(leaves, expected, "leaves not visited in sorted order");
     }
 
     use wgpu::util::DeviceExt;

@@ -28,10 +28,11 @@ into clean, separately-testable phases:
 | 2 | bounding box | the cube that holds all particles |
 | 3 | Morton codes | a Z-order key per particle |
 | 4 | **sort** | order particles along the curve |
-| 5 | LBVH build + mass/COM | a tree over the sorted particles |
+| 5a | LBVH structure | a tree over the sorted particles |
+| 5b | node mass/COM | aggregate up the tree |
 | 6 | traverse + integrate | the actual gravity + leapfrog step |
 
-Phases 0, 3 and 4 are implemented and validated so far.
+Phases 0, 3, 4 and 5a are implemented and validated so far.
 
 ## 2. A short GPU-compute crash course (wgpu)
 
@@ -164,17 +165,66 @@ lots of ties — and asserts the GPU result equals Rust's own `sort()` of the
 `(key, index)` pairs, keys **and** order. Because both use the total `(key, index)`
 order, the match is exact, ties included.
 
-## 5. Still to come
+## 5. Phase 5a — building the tree in parallel (Karras 2012)
+
+Now the beautiful part: build a whole binary tree over the sorted particles **with
+no recursion and no locks**, one thread per node, each figuring out its own place.
+This is Karras' LBVH construction (`LBVH_SHADER`, `build_lbvh_structure_gpu`).
+
+**Node numbering.** For `N` particles there are `N` leaves and `N-1` internal nodes.
+We give them one id space: internal nodes `0 … N-2`, leaves `N-1 … 2N-2` (leaf `k` is
+id `N-1+k`). The **root is internal node 0**, and it always covers the whole array.
+
+**The key idea — the δ function.** `δ(i, j)` is the number of leading bits the sorted
+codes at positions `i` and `j` share (using `countLeadingZeros(code_i XOR code_j)`).
+Because we sorted by `(code, index)`, when two codes are *equal* we fall back to the
+indices — `δ = 32 + countLeadingZeros(i XOR j)` — so every pair still has a definite
+ordering. A large `δ` means "these two particles are close on the curve." The whole
+tree is derived from `δ` alone.
+
+Each internal node `i` does three things (all by binary search on `δ`):
+
+1. **Direction.** Compare `δ(i, i+1)` with `δ(i, i-1)`: the node's range extends
+   toward whichever neighbour it shares more bits with (`d = ±1`).
+2. **Range.** Its range is `[i, j]` for some `j` in that direction. We find `j` by
+   first doubling a step until `δ` drops below `δ(i, i-d)` (an upper bound on the
+   length), then binary-searching the exact length.
+3. **Split.** Within `[i, j]`, the node splits where the shared-prefix length first
+   drops — again a binary search, giving position `γ`. The left child covers
+   `[first, γ]`, the right `[γ+1, last]`. A side that is a single element becomes a
+   **leaf**; otherwise it is the internal node with that index.
+
+The node writes its two children and — crucially — writes *itself* as each child's
+parent (`par[child] = i`). Those parent links are what the bottom-up mass pass
+(phase 5b) will climb.
+
+**Why no synchronisation is needed here:** every internal node reads only the
+(read-only) codes and writes only its own `lft`/`rgt` entry and its children's
+`par` entries. Different nodes never write the same slot, so the `N-1` threads are
+independent.
+
+**Trusting it.** `gpu_lbvh_is_a_valid_tree` builds the tree from 3000 codes drawn
+from a *small* range (so there are lots of duplicate codes, exercising the δ
+tiebreak), reads the structure back, and checks two things on the CPU: every child
+points back at its parent, and a **left-to-right walk from the root visits the
+leaves `0,1,…,N-1` in order** — which is exactly the property a correct radix tree
+over a sorted array must have. If any range or split were wrong, the leaf order
+would break.
+
+## 6. Still to come
 
 - **Phase 2 — bounding box** on the GPU (a parallel reduction), so the Morton step
   no longer needs a CPU-computed box.
-- **Phase 5 — LBVH build** (Karras 2012): from the sorted codes, build a binary
-  radix tree in parallel — each internal node finds its range and split point from
-  the length of the common bit-prefix (`δ`) between neighbours — then a bottom-up
-  pass fills each node's total mass and centre of mass.
+- **Phase 5b — node aggregates**: a bottom-up pass over the parent links that fills
+  each node's total mass, centre of mass and bounding box. Leaves start from their
+  particle; each internal node is finished when its *second* child arrives (tracked
+  with one atomic counter per node), then it climbs to its own parent. This is the
+  one place we lean on GPU atomics for ordering, so it gets careful testing against
+  a CPU re-computation of the same tree.
 - **Phase 6 — traverse + integrate**: one thread per particle walks the tree
-  (lump-or-open, just like the CPU version), then a leapfrog kick-drift-kick updates
-  the resident position/velocity buffers, which the point renderer draws directly.
+  (lump-or-open using each node's mass/COM/size, just like the CPU version), then a
+  leapfrog kick-drift-kick updates the resident position/velocity buffers, which the
+  point renderer draws directly.
 
-Each will land as its own kernel with its own CPU-reference test, so the whole GPU
+Each lands as its own kernel with its own CPU-reference test, so the whole GPU
 pipeline is trustworthy end to end even though the tree lives entirely on the card.
