@@ -8,15 +8,20 @@
 //! is replaced by a **single lump** at their centre of mass whenever the clump is
 //! small compared with its distance (`size / distance < θ`). Nearby clumps are
 //! opened up and looked at in detail. That turns the cost from `N²` into about
-//! `N·log N`, which is what makes an interactive galaxy collision possible.
+//! `N·log N`.
+//!
+//! For speed the tree is **flattened**: after building it as a normal pointer tree,
+//! we lay the cells out in one array in depth-first order and give each an index to
+//! "skip to" if it is accepted as a lump. Walking gravity is then a tight iterative
+//! loop over a compact array — either step to the next cell (open it) or jump past
+//! its whole subtree (lump it) — which the CPU cache loves. It is far faster than
+//! chasing pointers, and the per-body walks are independent, so they run in
+//! parallel (see [`Octree::accelerations`]).
 //!
 //! Everything is in `f64`. Units are left to the caller (pass your own `G`); the
 //! forces are softened (a small `ε`) so two bodies that come very close do not fly
 //! apart from a division by nearly zero — the right thing for a *smooth* galaxy
-//! made of sample particles.
-//!
-//! Phase 1 of the galaxy mode: the compute core, validated by its tests against the
-//! direct O(N²) sum. Nothing draws it yet, so allow the as-yet-unused public API.
+//! made of sample particles. Validated by its tests against the direct O(N²) sum.
 #![allow(dead_code)]
 
 use glam::DVec3;
@@ -30,15 +35,17 @@ use glam::DVec3;
 /// Units: a count of levels.
 const MAX_DEPTH: u32 = 64;
 
-/// One cube in the octree.
+// ---------------------------------------------------------------------------
+// Build-time pointer tree
+// ---------------------------------------------------------------------------
+
+/// One cube in the build-time pointer tree.
 ///
-/// What: a cell's geometry, the total mass and centre of mass of everything inside
-/// it, and links to its up-to-eight children.
-/// How/why: a "leaf" holds a single body in `body` (with any exact duplicates in
-/// `extra`); an "internal" cell has `internal = true` and points at children. The
-/// aggregate `mass`/`com` let Barnes–Hut treat a whole cell as one lump.
-/// Units: `center`/`half`/`com` in the caller's length unit; `mass` in its mass
-/// unit.
+/// What: a cell's geometry, the mass and centre of mass inside it, and links to its
+/// up-to-eight children (or the body it holds, if a leaf).
+/// How/why: this form is convenient to *build* by inserting bodies one at a time;
+/// it is then flattened into the fast [`FlatNode`] array and discarded.
+/// Units: caller's own.
 struct Node {
     center: DVec3,
     half: f64,
@@ -51,8 +58,6 @@ struct Node {
 }
 
 impl Node {
-    /// A fresh empty cell covering the cube centred at `center` with half-width
-    /// `half`.
     fn empty(center: DVec3, half: f64) -> Self {
         Node {
             center,
@@ -67,68 +72,21 @@ impl Node {
     }
 }
 
-/// A built Barnes–Hut octree over a set of bodies.
-///
-/// What: the cells (in one flat array) plus the accuracy/softening settings.
-/// How/why: a flat `Vec<Node>` with integer child links is cache-friendlier than
-/// heap-pointered nodes and avoids lifetime headaches.
-/// Units: `theta2 = θ²` and `softening2 = ε²` are dimensionless / length² in the
-/// caller's units.
-pub struct Octree {
+/// Builds the pointer tree by inserting bodies, then hands over its cells.
+struct Builder {
     nodes: Vec<Node>,
-    theta2: f64,
-    softening2: f64,
 }
 
-impl Octree {
-    /// Build the octree from body positions and masses.
+impl Builder {
+    /// Insert body `body` into cell `node` at tree depth `depth`.
     ///
-    /// What: returns a tree ready to answer gravity queries.
-    /// How/why: find the cube that bounds all bodies, then insert each body,
-    /// accumulating every cell's total mass and centre of mass as we go.
-    /// Principle: the tree records, at every scale, "how much mass is roughly here",
-    /// which is all Barnes–Hut needs to lump distant groups together.
-    /// Units: `pos` in a length unit, `mass` in a mass unit; `theta` dimensionless
-    /// (smaller = more accurate, slower); `softening` in the same length unit.
-    pub fn build(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64) -> Octree {
-        let mut tree = Octree {
-            nodes: Vec::new(),
-            theta2: theta * theta,
-            softening2: softening * softening,
-        };
-        if pos.is_empty() {
-            tree.nodes.push(Node::empty(DVec3::ZERO, 1.0));
-            return tree;
-        }
-        // The smallest cube that contains every body.
-        let mut lo = DVec3::splat(f64::INFINITY);
-        let mut hi = DVec3::splat(f64::NEG_INFINITY);
-        for p in pos {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
-        let center = (lo + hi) * 0.5;
-        // Pad a touch so bodies on the boundary sit strictly inside.
-        let half = (hi - lo).max_element() * 0.5 * 1.0001 + 1e-12;
-        tree.nodes.push(Node::empty(center, half));
-        for i in 0..pos.len() {
-            tree.insert(0, i, 0, pos, mass);
-        }
-        tree
-    }
-
-    /// Insert body `body` into the cell `node` at tree depth `depth`.
-    ///
-    /// What: adds one body to the tree, splitting the cell if it was already
-    /// occupied.
-    /// How/why: first fold the body into this cell's running mass and centre of
-    /// mass. An empty cell simply stores the body; an occupied leaf subdivides and
-    /// pushes both bodies down into the right child cubes; an already-internal cell
-    /// forwards the body to the child it falls in. At the depth cap, coincident
-    /// bodies just share the leaf.
-    /// Units: as [`build`].
+    /// What: adds one body, splitting the cell if it was already occupied.
+    /// How/why: fold the body into the cell's running mass and centre of mass, then
+    /// place it — an empty cell stores it, an occupied leaf subdivides and pushes
+    /// both bodies down, an internal cell forwards it to the right child. At the
+    /// depth cap coincident bodies just share the leaf.
+    /// Units: caller's own.
     fn insert(&mut self, node: usize, body: usize, depth: u32, pos: &[DVec3], mass: &[f64]) {
-        // Fold this body into the cell's total mass and centre of mass.
         {
             let n = &mut self.nodes[node];
             let bm = mass[body];
@@ -145,17 +103,14 @@ impl Octree {
             self.insert_into_child(node, body, depth, pos, mass);
             return;
         }
-        // Empty leaf: just take the body.
         if self.nodes[node].body < 0 {
             self.nodes[node].body = body as i32;
             return;
         }
-        // Occupied leaf at the depth cap: bucket coincident bodies together.
         if depth >= MAX_DEPTH {
             self.nodes[node].extra.push(body as u32);
             return;
         }
-        // Otherwise split: move the sitting body down, then the new one.
         let existing = self.nodes[node].body as usize;
         self.nodes[node].body = -1;
         self.nodes[node].internal = true;
@@ -163,12 +118,7 @@ impl Octree {
         self.insert_into_child(node, body, depth, pos, mass);
     }
 
-    /// Forward a body into the correct child cube of `parent`, creating it if new.
-    ///
-    /// What: routes a body one level down the tree.
-    /// How/why: pick the octant the body lies in, make that child cube if it does
-    /// not exist yet, then insert into it one level deeper.
-    /// Units: as [`build`].
+    /// Forward a body into the correct child cube, creating it if new.
     fn insert_into_child(&mut self, parent: usize, body: usize, depth: u32, pos: &[DVec3], mass: &[f64]) {
         let (center, half) = {
             let n = &self.nodes[parent];
@@ -184,73 +134,141 @@ impl Octree {
         }
         self.insert(child as usize, body, depth + 1, pos, mass);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flattened traversal tree
+// ---------------------------------------------------------------------------
+
+/// One cell in the flattened, traversal-optimised tree.
+///
+/// What: a cell's centre of mass, total mass, squared size, and the flat index to
+/// jump to if the cell is accepted as a single lump; for a leaf, the range of
+/// bodies it holds inside [`Octree::leaf_bodies`].
+/// How/why: laid out in depth-first order so "open this cell" is just the next
+/// index and "lump this cell" is a jump to `skip`. `size2` is pre-squared so the
+/// opening test is a bare multiply-compare. `body_count == 0` marks an internal
+/// cell.
+/// Units: caller's own; `size2` a length².
+#[derive(Clone, Copy)]
+struct FlatNode {
+    com: DVec3,
+    mass: f64,
+    size2: f64,
+    skip: u32,
+    body_start: u32,
+    body_count: u32,
+}
+
+/// A built Barnes–Hut octree, ready to answer gravity queries.
+///
+/// What: the flattened cells, the bodies grouped by leaf, and the accuracy /
+/// softening settings.
+/// Units: `theta2 = θ²` dimensionless; `softening2 = ε²` a length².
+pub struct Octree {
+    flat: Vec<FlatNode>,
+    leaf_bodies: Vec<u32>,
+    theta2: f64,
+    softening2: f64,
+}
+
+impl Octree {
+    /// Build the octree from body positions and masses.
+    ///
+    /// What: returns a flattened tree ready for fast queries.
+    /// How/why: find the cube bounding all bodies, insert each body into a pointer
+    /// tree (accumulating every cell's mass and centre of mass), then flatten it
+    /// into the depth-first array walked by [`acceleration`](Self::acceleration).
+    /// Units: `pos`/`mass` in the caller's units; `theta` dimensionless (smaller =
+    /// more accurate, slower); `softening` a length.
+    pub fn build(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64) -> Octree {
+        let mut tree = Octree {
+            flat: Vec::new(),
+            leaf_bodies: Vec::new(),
+            theta2: theta * theta,
+            softening2: softening * softening,
+        };
+        if pos.is_empty() {
+            return tree;
+        }
+        // Bounding cube.
+        let mut lo = DVec3::splat(f64::INFINITY);
+        let mut hi = DVec3::splat(f64::NEG_INFINITY);
+        for p in pos {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let center = (lo + hi) * 0.5;
+        let half = (hi - lo).max_element() * 0.5 * 1.0001 + 1e-12;
+
+        // Build the pointer tree.
+        let mut builder = Builder {
+            nodes: vec![Node::empty(center, half)],
+        };
+        for i in 0..pos.len() {
+            builder.insert(0, i, 0, pos, mass);
+        }
+
+        // Flatten it depth-first into the fast array.
+        tree.flat.reserve(builder.nodes.len());
+        flatten(&builder.nodes, 0, &mut tree.flat, &mut tree.leaf_bodies);
+        tree
+    }
 
     /// Gravitational acceleration on body `i` from all the others.
     ///
     /// What: returns the acceleration vector body `i` feels.
-    /// How/why: walk the tree from the root. A far-enough internal cell (its size is
-    /// small next to its distance, `size/distance < θ`) is treated as one lump at
-    /// its centre of mass; otherwise we open it and look at its children. Leaves are
-    /// summed body-by-body (skipping `i` itself). Each pull uses the softened
-    /// inverse-square law `a = G·m·(r⃗)/(|r⃗|² + ε²)^{3/2}`.
+    /// How/why: iterate the flattened cells. For an internal cell, if it is far
+    /// enough (`size² < θ²·distance²`) add its lump pull and jump past its subtree
+    /// (`skip`); otherwise step into it. Leaves are summed body-by-body (skipping
+    /// `i`). Each pull uses the softened law `a = G·m·r⃗/(|r⃗|² + ε²)^{3/2}`.
     /// Principle: Newton's gravity, with distant crowds approximated by their centre
-    /// of mass — accurate because a far clump really does pull almost exactly like a
-    /// point at its centre of mass.
-    /// Units: `pos`/`mass` as [`build`]; `g` the gravitational constant in the
-    /// caller's units; returns an acceleration in those units.
+    /// of mass.
+    /// Units: `pos`/`mass` as [`build`](Self::build); `g` the gravitational constant;
+    /// returns an acceleration in those units.
     pub fn acceleration(&self, i: usize, pos: &[DVec3], mass: &[f64], g: f64) -> DVec3 {
+        let pi = pos[i];
         let mut acc = DVec3::ZERO;
-        self.accel_node(0, i, pos, mass, &mut acc);
-        acc * g
-    }
-
-    /// Recursive helper for [`acceleration`] (adds one cell's pull into `acc`).
-    ///
-    /// What: accumulates the pull of cell `node` on body `i`.
-    /// How/why: applies the opening test `(size)² < θ²·distance²` to decide lump vs
-    /// recurse; see [`acceleration`].
-    /// Units: accumulates the un-scaled sum (the caller multiplies by `g`).
-    fn accel_node(&self, node: usize, i: usize, pos: &[DVec3], mass: &[f64], acc: &mut DVec3) {
-        let n = &self.nodes[node];
-        if n.mass == 0.0 {
-            return;
-        }
-        if n.internal {
-            let d = n.com - pos[i];
-            let r2 = d.length_squared();
-            let size = 2.0 * n.half;
-            if size * size < self.theta2 * r2 {
-                let soft = r2 + self.softening2;
-                *acc += n.mass * d / (soft * soft.sqrt());
+        let mut idx = 0usize;
+        let count = self.flat.len();
+        while idx < count {
+            let node = &self.flat[idx];
+            if node.body_count == 0 {
+                // Internal cell: lump it if far enough, else open it.
+                let d = node.com - pi;
+                let r2 = d.length_squared();
+                if node.size2 < self.theta2 * r2 {
+                    let soft = r2 + self.softening2;
+                    acc += node.mass * d / (soft * soft.sqrt());
+                    idx = node.skip as usize;
+                } else {
+                    idx += 1;
+                }
             } else {
-                for &c in &n.children {
-                    if c >= 0 {
-                        self.accel_node(c as usize, i, pos, mass, acc);
+                // Leaf: direct pull from each body it holds (never from `i`).
+                let s = node.body_start as usize;
+                for &b in &self.leaf_bodies[s..s + node.body_count as usize] {
+                    let b = b as usize;
+                    if b != i {
+                        add_pull(pos[b], mass[b], pi, self.softening2, &mut acc);
                     }
                 }
-            }
-        } else {
-            if n.body >= 0 && n.body as usize != i {
-                add_pull(pos[n.body as usize], mass[n.body as usize], pos[i], self.softening2, acc);
-            }
-            for &b in &n.extra {
-                if b as usize != i {
-                    add_pull(pos[b as usize], mass[b as usize], pos[i], self.softening2, acc);
-                }
+                idx += 1;
             }
         }
+        acc * g
     }
 
     /// Build a tree and return the acceleration on every body, in parallel.
     ///
     /// What: the convenient one-call version — build once, query all bodies across
     /// all CPU cores.
-    /// How/why: the built tree is read-only, and each body's query only reads it, so
-    /// the per-body loop is embarrassingly parallel; `rayon` spreads it over the
-    /// cores. `into_par_iter` over a range keeps the results in order, so the output
-    /// is identical to (and as deterministic as) the sequential version — the tests
-    /// that check it against the direct sum therefore also check the parallel path.
-    /// Units: as [`build`] / [`acceleration`].
+    /// How/why: the flattened tree is read-only, and each body's query only reads
+    /// it, so the per-body loop is embarrassingly parallel; `rayon` spreads it over
+    /// the cores. Range order is preserved, so the output is identical to (and as
+    /// deterministic as) a sequential run — the tests that check it against the
+    /// direct sum therefore also check the parallel path.
+    /// Units: as [`build`](Self::build) / [`acceleration`](Self::acceleration).
     pub fn accelerations(pos: &[DVec3], mass: &[f64], theta: f64, softening: f64, g: f64) -> Vec<DVec3> {
         use rayon::prelude::*;
         let tree = Octree::build(pos, mass, theta, softening);
@@ -261,24 +279,57 @@ impl Octree {
     }
 }
 
+/// Depth-first flatten of the pointer tree into the fast array.
+///
+/// What: appends the cell at `ni` and its subtree to `flat`, recording leaf bodies
+/// in `leaf_bodies`, and sets each cell's `skip` to the index just past its subtree.
+/// How/why: emitting in depth-first order makes "open" = next index and "lump" =
+/// jump to `skip`.
+/// Units: caller's own.
+fn flatten(nodes: &[Node], ni: usize, flat: &mut Vec<FlatNode>, leaf_bodies: &mut Vec<u32>) {
+    let n = &nodes[ni];
+    let idx = flat.len();
+    let size = 2.0 * n.half;
+    flat.push(FlatNode {
+        com: n.com,
+        mass: n.mass,
+        size2: size * size,
+        skip: 0,
+        body_start: 0,
+        body_count: 0,
+    });
+    if n.internal {
+        for &c in &n.children {
+            if c >= 0 {
+                flatten(nodes, c as usize, flat, leaf_bodies);
+            }
+        }
+    } else {
+        let start = leaf_bodies.len() as u32;
+        if n.body >= 0 {
+            leaf_bodies.push(n.body as u32);
+        }
+        leaf_bodies.extend_from_slice(&n.extra);
+        flat[idx].body_start = start;
+        flat[idx].body_count = leaf_bodies.len() as u32 - start;
+    }
+    let end = flat.len() as u32;
+    flat[idx].skip = end;
+}
+
 /// Add the softened pull of one body at `src` (mass `m`) on a body at `dst`.
 ///
 /// What: accumulates `m·(src−dst)/(|src−dst|² + ε²)^{3/2}` into `acc`.
 /// How/why: the softened inverse-square law; the `ε²` keeps the force finite when
-/// two sample particles nearly coincide (we model a smooth mass, not point stars).
-/// Units: length/mass in the caller's units; `soft2 = ε²`.
+/// two sample particles nearly coincide.
+/// Units: caller's own; `soft2 = ε²`.
 fn add_pull(src: DVec3, m: f64, dst: DVec3, soft2: f64, acc: &mut DVec3) {
     let d = src - dst;
     let soft = d.length_squared() + soft2;
     *acc += m * d / (soft * soft.sqrt());
 }
 
-/// Which of the eight octants of a cube a point falls into.
-///
-/// What: returns 0..8, one bit per axis (x = bit 0, y = bit 1, z = bit 2).
-/// How/why: comparing the point to the cube centre on each axis gives the child
-/// index directly.
-/// Units: positions in the caller's length unit.
+/// Which of the eight octants of a cube a point falls into (x = bit 0, …).
 fn octant(center: DVec3, p: DVec3) -> usize {
     (p.x >= center.x) as usize
         | (((p.y >= center.y) as usize) << 1)
@@ -286,11 +337,6 @@ fn octant(center: DVec3, p: DVec3) -> usize {
 }
 
 /// The centre and half-width of child octant `oct` of a cube.
-///
-/// What: returns `(child_center, child_half)`.
-/// How/why: each child is half the size, offset by a quarter of the parent width in
-/// each axis according to the octant's bits.
-/// Units: length in the caller's unit.
 fn child_box(center: DVec3, half: f64, oct: usize) -> (DVec3, f64) {
     let h = half * 0.5;
     let dx = if oct & 1 != 0 { h } else { -h };
@@ -400,8 +446,7 @@ mod tests {
         assert!(err(0.2) <= err(0.8), "tighter theta should not be worse");
     }
 
-    /// A lone body feels no force (no self-attraction), and coincident bodies are
-    /// handled without blowing up.
+    /// A lone body feels no force, and coincident bodies stay finite.
     #[test]
     fn degenerate_cases_are_safe() {
         let one = Octree::accelerations(&[DVec3::new(1.0, 2.0, 3.0)], &[1.0], 0.5, 0.1, 1.0);
@@ -414,4 +459,5 @@ mod tests {
             assert!(a.is_finite(), "coincident bodies must stay finite");
         }
     }
+
 }
