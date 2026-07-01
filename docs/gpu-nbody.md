@@ -31,10 +31,10 @@ into clean, separately-testable phases:
 | 5a | LBVH structure | a tree over the sorted particles |
 | 5b | node mass/COM/box | aggregate up the tree |
 | 6 | traverse (forces) | the actual gravity on every body |
-| — | resident + integrate | keep it all on the GPU, leapfrog step |
+| 7 | resident + integrate | keep it all on the GPU, leapfrog step |
 
-Phases 0, 2, 3, 4, 5a, 5b and 6 (the forces) are implemented and validated; only
-making the state GPU-resident and adding the integration step remain.
+All phases are implemented and validated. The galaxy collision now steps entirely on
+the GPU (`GpuNBody`), with only the positions copied back each frame to draw.
 
 ## 2. A short GPU-compute crash course (wgpu)
 
@@ -363,15 +363,54 @@ tree is a *binary* LBVH, not the CPU's octree, so the two differ node-for-node; 
 they both land within Barnes–Hut error of the direct sum is exactly the point. Mean
 relative error comes out well under 1 %.
 
-## 9. Still to come
+## 9. Making it resident — the whole step on the GPU
 
-- **Make it resident and integrate.** The reference `accelerations_gpu` reads each
-  stage back to the CPU and re-uploads it — fine for testing, wasteful for real time.
-  The live version keeps positions, velocities and the tree in GPU buffers across the
-  whole step, runs a leapfrog kick–drift–kick in a compute shader, and lets the point
-  renderer draw straight from the position buffer — no per-frame copy. That is the
-  last phase: wiring this into the galaxy mode in `galaxy_mode.rs` / `main.rs`.
+The reference `accelerations_gpu` reads each stage back to the CPU and re-uploads it:
+perfect for testing, but every readback stalls the CPU, so it would be *slower* than
+the CPU octree in real time. The live path (`GpuNBody`) instead keeps **everything
+resident** and does a full leapfrog step as **one command submission**.
 
-Each phase landed as its own kernel with its own CPU-reference test, so the whole GPU
-pipeline — box, codes, sort, tree, masses, forces — is trustworthy end to end even
-though it all lives on the card.
+**State that never leaves the card.** Positions, velocities, accelerations and masses
+live in GPU buffers, as does all the tree scratch (codes, the sort arrays, the child
+links, the node mass/COM/box arrays). Sizes depend only on `N`, so they are allocated
+once. One `step(dt)` encodes, back to back:
+
+```
+kick-1 + drift        (integrate)          v += a·½dt ;  x += v·dt
+rebuild the tree      box → codes → sort → LBVH → mass/COM/box
+walk it               forces → a
+kick-2                (integrate)          v += a·½dt
+```
+
+Between the validated shaders sit a few tiny **glue kernels** that just move data on
+the card: a Morton kernel that reads the box from a buffer (not a CPU uniform), a
+sort-setup that writes the padded `(code, index)` arrays, a **gather** that reorders
+particles into Morton order for the leaves, a **seed** that primes the leaves for the
+refit, and a **scatter** that sends each force back to its original particle. Because
+each stage is its own compute pass, the pass boundaries supply all the ordering — the
+same mechanism the sort and the refit already relied on.
+
+**Two small design choices that avoid readbacks mid-step.** The refit's convergence
+depends on the tree height, which we don't know without looking; rather than read a
+flag back each level, we just run a **fixed 64 passes** — comfortably more than the
+`~30 + log₂N` a Morton tree can ever be deep, and extra passes are free no-ops. And
+the traversal stack is a fixed 64 entries for the same reason. So the entire step is
+GPU-only; the *only* thing that ever comes back is the **position buffer, once per
+frame, to draw** (`galaxy_mode.rs` mirrors it to colour the point cloud).
+
+### Trusting it
+
+Two headless tests guard the live path. `resident_stepper_matches_cpu_leapfrog`
+integrates the *same* initial conditions on the GPU and with the CPU `Particles`
+leapfrog at θ = 0 (exact forces both sides) and checks the particles still coincide
+after 50 steps — so the kick/drift/gather/walk/scatter plumbing is correct, not just
+the forces. `resident_stepper_large_stays_finite` runs a 16 384-body cloud (a power of
+two, so the sort takes the no-padding path) and checks nothing goes NaN or flies
+away — a guard on the sort size, the 64-pass refit, and the traversal stack at real
+scale.
+
+---
+
+Every phase landed as its own kernel with its own CPU-reference test, so the whole GPU
+pipeline — box, codes, sort, tree, masses, forces, and now a resident leapfrog — is
+trustworthy end to end, and the galaxy collision runs entirely on the card.

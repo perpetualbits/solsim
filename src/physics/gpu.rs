@@ -8,9 +8,13 @@
 //! plain CPU reference. Compute needs no window, so those checks run headless in
 //! the test suite.
 //!
-//! This module currently holds only that foundation: a tiny helper to grab a
-//! headless device and a smoke test that a compute shader runs and its result can
-//! be read back. The tree kernels build on top of it.
+//! The pipeline is complete: bounding box, Morton codes, a bitonic sort, the Karras
+//! LBVH build, a bottom-up mass/COM/box refit, and a per-particle tree walk — each a
+//! compute kernel with its own CPU-reference test. [`GpuNBody`] ties them together
+//! into a fully resident leapfrog: one command submission per step, with only the
+//! positions copied back each frame to draw. See `docs/gpu-nbody.md` for the whole
+//! story. The standalone `*_gpu` functions (which read each stage back) remain as the
+//! validated reference the resident stepper is built from.
 #![allow(dead_code)]
 
 use glam::Vec3;
@@ -2434,6 +2438,45 @@ mod tests {
         // The cluster spans ~2 units; exact-force leapfrogs must stay within a whisker.
         assert!(mean < 0.02, "mean position drift {mean} too high");
         assert!(worst < 0.1, "worst position drift {worst} too high");
+    }
+
+    /// At galaxy scale the resident stepper must stay finite and bounded.
+    ///
+    /// This exercises the real code paths the 60k-body galaxy uses: a large bitonic
+    /// sort, the fixed 64-pass refit against a deep tree, and the 64-entry traversal
+    /// stack. `n` is a power of two, so the sort needs no padding — a worthwhile edge
+    /// case. We step a self-gravitating cloud and check nothing blows up (no NaNs, and
+    /// the cloud does not explode), which would flag an out-of-bounds tree or stack.
+    #[test]
+    fn resident_stepper_large_stays_finite() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+        let n = 16384usize; // power of two: sort runs with no sentinel padding
+        let mut pos = Vec::with_capacity(n);
+        let mut vel = Vec::with_capacity(n);
+        for _ in 0..n {
+            pos.push(Vec3::new(
+                rng.unit() as f32 * 4.0 - 2.0,
+                rng.unit() as f32 * 4.0 - 2.0,
+                rng.unit() as f32 * 4.0 - 2.0,
+            ));
+            vel.push(Vec3::ZERO);
+        }
+        let mass = vec![1.0f32 / n as f32; n]; // light particles: gentle, bounded motion
+
+        let gpu = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.6, 0.1, 1.0);
+        for _ in 0..6 {
+            gpu.step(&device, &queue, 0.01);
+        }
+        let out = gpu.positions(&device, &queue);
+        assert_eq!(out.len(), n);
+        for (i, p) in out.iter().enumerate() {
+            assert!(p.is_finite(), "particle {i} went non-finite: {p:?}");
+            assert!(p.length() < 100.0, "particle {i} flew away to {p:?}");
+        }
     }
 
     use wgpu::util::DeviceExt;

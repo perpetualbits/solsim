@@ -1456,7 +1456,11 @@ impl App {
         let Some(mut gm) = self.galaxy.take() else {
             return;
         };
-        gm.step();
+        // Step on the GPU (borrow the device/queue just for the step, then release
+        // so the render path below can borrow the GPU state mutably).
+        if let Some(gpu) = self.gpu.as_ref() {
+            gm.step(&gpu.device, &gpu.queue);
+        }
         let center = gm.center();
         let points = gm.points(center);
         let sim_time = gm.time();
@@ -1788,9 +1792,10 @@ impl ApplicationHandler for App {
                                 // Back to the solar system.
                                 self.galaxy = None;
                                 self.camera = OrbitCamera::default();
-                            } else {
+                            } else if let Some(gpu) = self.gpu.as_ref() {
                                 // Enter the colliding-galaxies mode; frame the pair.
-                                self.galaxy = Some(galaxy_mode::GalaxyMode::new());
+                                self.galaxy =
+                                    Some(galaxy_mode::GalaxyMode::new(&gpu.device, &gpu.queue));
                                 self.viewpoint = Viewpoint::Free;
                                 self.camera.target = DVec3::ZERO;
                                 self.camera.min_radius = 1.0e-3;
