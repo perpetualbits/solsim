@@ -409,6 +409,55 @@ two, so the sort takes the no-padding path) and checks nothing goes NaN or flies
 away — a guard on the sort size, the 64-pass refit, and the traversal stack at real
 scale.
 
+## 10. Making it fast — measure, then cut
+
+Working is not the same as fast. At 60 002 bodies the first version stepped in about
+70 ms. The rule is **measure before you optimise**, so a per-stage timer
+(`profile`, run on the real GPU) printed where the step went:
+
+```
+   bitonic-sort   1.6 ms
+      refit(64)   1.0 ms
+       traverse  68.7 ms   ← 96 % of the step
+   everything else < 0.9 ms
+```
+
+So the tree *walk* is the whole game; nothing else is worth touching. And 60k bodies ×
+~2000 interactions in 68 ms is only ~1.8 billion interactions/second — far below what
+the chip can do — which is the signature of a **memory-bound** kernel, not a
+compute-bound one. The walk was re-reading a lot per node: three `vec4`s (centre of
+mass, and the two box corners) plus a separate mass array, and it recomputed the
+node's size from the corners *on every visit* — even though one node is visited by
+thousands of particles.
+
+The fix is to **pack the node record for the walk**:
+- the mass rides in the unused `w` lane of the centre-of-mass vector (`com.w`), so the
+  separate mass array is gone;
+- the size is computed **once** after the refit (a tiny one-thread-per-node kernel,
+  `SIZE_SHADER`) into a `node_size2` array, instead of from the corners every visit.
+
+Now each node touched costs one `vec4` read (plus one float if it's internal), down
+from three `vec4`s and an arithmetic size calculation. Same tree, same forces, same
+tests green — just less memory traffic. The result:
+
+```
+       traverse  68.7 ms  →  25.2 ms     (2.7× on the hot stage)
+   full-forces   71.7 ms  →  28.7 ms
+```
+
+A 2.7× win from moving bytes, not flops — exactly what "memory-bound" predicted.
+
+**Where the remaining time goes, and the next lever.** The walk is still ~90 % of the
+step and still memory/divergence-bound. The big structural win left is
+**warp-cooperative traversal**: because the particles are Morton-sorted, the 32 threads
+of a warp are neighbours in space and want to open almost the same nodes, yet today
+each walks its own stack and the warp waits for its most-divergent lane. Having the
+warp share one stack and open a node if *any* lane needs it removes that divergence —
+typically another 2–4× — at the cost of a more intricate kernel (subgroup ballots).
+The cheap knob in the meantime is the opening angle θ: raising it lumps more and visits
+fewer nodes (faster, slightly rougher), which for a *visual* simulation is often a fine
+trade.
+
 ---
 
 Every phase landed as its own kernel with its own CPU-reference test, so the whole GPU

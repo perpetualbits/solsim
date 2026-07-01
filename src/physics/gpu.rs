@@ -800,13 +800,11 @@ pub fn aggregate_nodes_gpu(
 const TRAVERSE_SHADER: &str = r#"
 struct Uni { n: u32, theta2: f32, soft2: f32, g: f32 };
 @group(0) @binding(0) var<uniform> u: Uni;
-@group(0) @binding(1) var<storage, read> node_mass: array<f32>;
-@group(0) @binding(2) var<storage, read> node_com: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> node_lo: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read> node_hi: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read> lft: array<u32>;
-@group(0) @binding(6) var<storage, read> rgt: array<u32>;
-@group(0) @binding(7) var<storage, read_write> out_acc: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> node_com: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> node_size2: array<f32>;
+@group(0) @binding(3) var<storage, read> lft: array<u32>;
+@group(0) @binding(4) var<storage, read> rgt: array<u32>;
+@group(0) @binding(5) var<storage, read_write> out_acc: array<vec4<f32>>;
 
 // Barnes–Hut gravity on one particle by walking the tree with a private stack.
 // For each node: if it is a far-enough lump (size² < θ²·r²) add its pull and don't
@@ -814,6 +812,12 @@ struct Uni { n: u32, theta2: f32, soft2: f32, g: f32 };
 // particles; the leaf that IS this particle contributes nothing because its offset
 // r⃗ = 0 makes the numerator m·r⃗ vanish, so no self-force test is needed. Each pull
 // uses the softened law a⃗ = G·m·r⃗ / (|r⃗|² + ε²)^{3/2}, matching the CPU octree.
+//
+// The node record is packed for the walk: `node_com` carries the centre of mass in
+// xyz and the total mass in w, and `node_size2` holds the box-diagonal² precomputed
+// once (a node is visited by thousands of particles, so computing its size per visit
+// was pure waste). So each node touched costs one vec4 read (+ one float if internal),
+// not three vec4s plus a size calculation — the walk is memory-bound, so this matters.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
@@ -830,20 +834,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (sp == 0u) { break; }
         sp = sp - 1u;
         let node = stack[sp];
-        let d = node_com[node].xyz - pi;
+        let cm = node_com[node];                   // xyz = centre of mass, w = mass
+        let d = cm.xyz - pi;
         let r2 = dot(d, d);
 
         if (node >= leaf_base) {
             // A leaf: one particle. Self gives d=0 → adds nothing.
             let soft = r2 + u.soft2;
-            acc = acc + node_mass[node] * d / (soft * sqrt(soft));
+            acc = acc + cm.w * d / (soft * sqrt(soft));
         } else {
             // Internal node: lump if far enough, else open it.
-            let ext = node_hi[node].xyz - node_lo[node].xyz;
-            let s2 = dot(ext, ext);                   // node size² = box diagonal²
-            if (s2 < u.theta2 * r2) {
+            if (node_size2[node] < u.theta2 * r2) {
                 let soft = r2 + u.soft2;
-                acc = acc + node_mass[node] * d / (soft * sqrt(soft));
+                acc = acc + cm.w * d / (soft * sqrt(soft));
             } else if (sp <= 62u) {                  // room for two children
                 stack[sp] = lft[node]; sp = sp + 1u;
                 stack[sp] = rgt[node]; sp = sp + 1u;
@@ -894,13 +897,22 @@ pub fn accelerations_gpu(
     let leaf_mass: Vec<f32> = order.iter().map(|&o| mass[o as usize]).collect();
 
     let (left, right, parent) = build_lbvh_structure_gpu(device, queue, &sorted_codes);
-    let (node_mass, node_com, node_lo, node_hi) =
+    let (_node_mass, node_com, node_lo, node_hi) =
         aggregate_nodes_gpu(device, queue, &left, &right, &parent, &leaf_mass, &leaf_com);
 
+    // Precompute each node's size² (box diagonal²) once — the walk reads it directly.
+    let node_size2: Vec<f32> = node_lo
+        .iter()
+        .zip(&node_hi)
+        .map(|(lo, hi)| {
+            let e = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            e[0] * e[0] + e[1] * e[1] + e[2] * e[2]
+        })
+        .collect();
+
     // The tree walk.
-    let acc_sorted = traverse_gpu(
-        device, queue, &node_mass, &node_com, &node_lo, &node_hi, &left, &right, theta, softening, g,
-    );
+    let acc_sorted =
+        traverse_gpu(device, queue, &node_com, &node_size2, &left, &right, theta, softening, g);
 
     // Scatter accelerations back to the caller's original particle order.
     let mut acc = vec![Vec3::ZERO; n];
@@ -921,17 +933,15 @@ pub fn accelerations_gpu(
 fn traverse_gpu(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    node_mass: &[f32],
     node_com: &[[f32; 4]],
-    node_lo: &[[f32; 4]],
-    node_hi: &[[f32; 4]],
+    node_size2: &[f32],
     left: &[u32],
     right: &[u32],
     theta: f32,
     softening: f32,
     g: f32,
 ) -> Vec<Vec3> {
-    let total = node_mass.len();
+    let total = node_com.len();
     let n = total.div_ceil(2); // total = 2n-1
     let uni = Uniforms {
         n: n as u32,
@@ -951,10 +961,8 @@ fn traverse_gpu(
             usage: wgpu::BufferUsages::STORAGE,
         })
     };
-    let mass_buf = ro(bytemuck::cast_slice(node_mass), "traverse mass");
     let com_buf = ro(bytemuck::cast_slice(node_com), "traverse com");
-    let lo_buf = ro(bytemuck::cast_slice(node_lo), "traverse lo");
-    let hi_buf = ro(bytemuck::cast_slice(node_hi), "traverse hi");
+    let size_buf = ro(bytemuck::cast_slice(node_size2), "traverse size2");
     let lft_buf = ro(bytemuck::cast_slice(left), "traverse lft");
     let rgt_buf = ro(bytemuck::cast_slice(right), "traverse rgt");
     let acc_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -976,9 +984,7 @@ fn traverse_gpu(
             storage_entry(2, true),
             storage_entry(3, true),
             storage_entry(4, true),
-            storage_entry(5, true),
-            storage_entry(6, true),
-            storage_entry(7, false),
+            storage_entry(5, false),
         ],
     });
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -986,13 +992,11 @@ fn traverse_gpu(
         layout: &layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: uni_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: mass_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: com_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: lo_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: hi_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: lft_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: rgt_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: acc_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: com_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: size_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: lft_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: rgt_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: acc_buf.as_entire_binding() },
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1439,6 +1443,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Precompute each node's size² (box diagonal²) for the walk. One thread per node.
+const SIZE_SHADER: &str = r#"
+struct U { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> node_lo: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> node_hi: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> node_size2: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let id = gid.x;
+    let total = 2u * u.n - 1u;
+    if (id >= total) { return; }
+    let e = node_hi[id].xyz - node_lo[id].xyz;
+    node_size2[id] = dot(e, e);
+}
+"#;
+
 /// Scatter the per-leaf accelerations back to the original particle order.
 const SCATTER_SHADER: &str = r#"
 struct U { n: u32, _a: u32, _b: u32, _c: u32 };
@@ -1496,6 +1517,7 @@ pub struct GpuNBody {
     p_seed: wgpu::ComputePipeline,
     p_lbvh: wgpu::ComputePipeline,
     p_agg: wgpu::ComputePipeline,
+    p_size: wgpu::ComputePipeline,
     p_trav: wgpu::ComputePipeline,
     p_scatter: wgpu::ComputePipeline,
     // Bind groups.
@@ -1510,6 +1532,7 @@ pub struct GpuNBody {
     b_lbvh: wgpu::BindGroup,
     b_agg_ab: wgpu::BindGroup,
     b_agg_ba: wgpu::BindGroup,
+    b_size: wgpu::BindGroup,
     b_trav: wgpu::BindGroup,
     b_scatter: wgpu::BindGroup,
     // Readback for drawing.
@@ -1585,6 +1608,7 @@ impl GpuNBody {
         let node_com = zeros((total * 16) as u64, storage, "node com");
         let node_lo = zeros((total * 16) as u64, storage, "node lo");
         let node_hi = zeros((total * 16) as u64, storage, "node hi");
+        let node_size2 = zeros((total * 4) as u64, storage, "node size2");
         let done_a = zeros((total * 4) as u64, storage, "done a");
         let done_b = zeros((total * 4) as u64, storage, "done b");
         let acc_sorted = zeros((n * 16) as u64, storage, "acc sorted");
@@ -1838,6 +1862,13 @@ impl GpuNBody {
         let b_agg_ab = agg_bind(&done_a, &done_b);
         let b_agg_ba = agg_bind(&done_b, &done_a);
 
+        let (p_size, l_size) = mk(
+            SIZE_SHADER,
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false)],
+            "size",
+        );
+        let b_size = bind(&l_size, &[&uni_n, &node_lo, &node_hi, &node_size2], "size");
+
         let (p_trav, l_trav) = mk(
             TRAVERSE_SHADER,
             &[
@@ -1846,15 +1877,13 @@ impl GpuNBody {
                 storage_entry(2, true),
                 storage_entry(3, true),
                 storage_entry(4, true),
-                storage_entry(5, true),
-                storage_entry(6, true),
-                storage_entry(7, false),
+                storage_entry(5, false),
             ],
             "trav",
         );
         let b_trav = bind(
             &l_trav,
-            &[&uni_trav, &node_mass, &node_com, &node_lo, &node_hi, &lft, &rgt, &acc_sorted],
+            &[&uni_trav, &node_com, &node_size2, &lft, &rgt, &acc_sorted],
             "trav",
         );
 
@@ -1886,6 +1915,7 @@ impl GpuNBody {
             p_seed,
             p_lbvh,
             p_agg,
+            p_size,
             p_trav,
             p_scatter,
             b_pre,
@@ -1899,6 +1929,7 @@ impl GpuNBody {
             b_lbvh,
             b_agg_ab,
             b_agg_ba,
+            b_size,
             b_trav,
             b_scatter,
             pos_readback,
@@ -1950,6 +1981,7 @@ impl GpuNBody {
             let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
             one(enc, &self.p_agg, bg, &[], gtot);
         }
+        one(enc, &self.p_size, &self.b_size, &[], gtot); // pack node size² for the walk
         one(enc, &self.p_trav, &self.b_trav, &[], gn);
         one(enc, &self.p_scatter, &self.b_scatter, &[], gn);
     }
@@ -2031,6 +2063,78 @@ impl GpuNBody {
     /// Whether the system is empty (never, but clippy likes the pair).
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Time each stage of a step in isolation (test/diagnostic only).
+    ///
+    /// Returns `(stage_name, milliseconds)` averaged over `iters` runs, submitting and
+    /// waiting on each stage separately so we can see where the time goes.
+    #[cfg(test)]
+    pub(crate) fn profile(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        iters: usize,
+    ) -> Vec<(&'static str, f64)> {
+        use std::time::Instant;
+        fn one(
+            enc: &mut wgpu::CommandEncoder,
+            pipe: &wgpu::ComputePipeline,
+            bg: &wgpu::BindGroup,
+            offset: &[u32],
+            groups: u32,
+        ) {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            p.set_pipeline(pipe);
+            p.set_bind_group(0, bg, offset);
+            p.dispatch_workgroups(groups, 1, 1);
+        }
+        let gn = (self.n as u32).div_ceil(64);
+        let gtot = ((2 * self.n - 1) as u32).div_ceil(64);
+        let gm = (self.n.next_power_of_two() as u32).div_ceil(64);
+
+        let bench = |label: &'static str, f: &mut dyn FnMut(&mut wgpu::CommandEncoder)| {
+            for _ in 0..3 {
+                let mut e = device.create_command_encoder(&Default::default());
+                f(&mut e);
+                queue.submit(Some(e.finish()));
+                device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut e = device.create_command_encoder(&Default::default());
+                f(&mut e);
+                queue.submit(Some(e.finish()));
+                device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+            (label, t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+        };
+
+        let mut out = Vec::new();
+        out.push(bench("bbox", &mut |e| one(e, &self.p_bbox, &self.b_bbox, &[], 1)));
+        out.push(bench("morton", &mut |e| one(e, &self.p_morton, &self.b_morton, &[], gn)));
+        out.push(bench("sort-setup", &mut |e| one(e, &self.p_setup, &self.b_setup, &[], gm)));
+        out.push(bench("bitonic-sort", &mut |e| {
+            for idx in 0..self.bitonic_passes {
+                one(e, &self.p_bitonic, &self.b_bitonic, &[(idx * 256) as u32], gm);
+            }
+        }));
+        out.push(bench("gather", &mut |e| one(e, &self.p_gather, &self.b_gather, &[], gn)));
+        out.push(bench("seed", &mut |e| one(e, &self.p_seed, &self.b_seed, &[], gtot)));
+        out.push(bench("lbvh-build", &mut |e| one(e, &self.p_lbvh, &self.b_lbvh, &[], gn)));
+        out.push(bench("refit(64)", &mut |e| {
+            for i in 0..REFIT_PASSES {
+                let bg = if i.is_multiple_of(2) { &self.b_agg_ab } else { &self.b_agg_ba };
+                one(e, &self.p_agg, bg, &[], gtot);
+            }
+        }));
+        out.push(bench("traverse", &mut |e| one(e, &self.p_trav, &self.b_trav, &[], gn)));
+        out.push(bench("scatter", &mut |e| one(e, &self.p_scatter, &self.b_scatter, &[], gn)));
+        out.push(bench("full-forces", &mut |e| self.encode_forces(e)));
+        out
     }
 }
 
@@ -2441,6 +2545,38 @@ mod tests {
         // The cluster spans ~2 units; exact-force leapfrogs must stay within a whisker.
         assert!(mean < 0.02, "mean position drift {mean} too high");
         assert!(worst < 0.1, "worst position drift {worst} too high");
+    }
+
+    /// Per-stage timing on the real GPU at galaxy scale. Ignored by default; run with
+    /// `cargo test --release profile_resident_stages -- --ignored --nocapture`.
+    ///
+    /// Each stage is submitted on its own and waited on, so the printed milliseconds
+    /// over-serialise a little versus the fused step, but the *relative* costs show
+    /// exactly where a step spends its time — which is what tells us what to optimise.
+    #[test]
+    #[ignore]
+    fn profile_resident_stages() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0xB16_5CA1E_0F16_1234);
+        let n = 60_002usize; // the galaxy's body count (2 × 30 000 disks + 2 cores)
+        let mut pos = Vec::with_capacity(n);
+        let mut vel = Vec::with_capacity(n);
+        for _ in 0..n {
+            pos.push(Vec3::new(
+                rng.unit() as f32 * 4.0 - 2.0,
+                rng.unit() as f32 * 4.0 - 2.0,
+                rng.unit() as f32 * 4.0 - 2.0,
+            ));
+            vel.push(Vec3::ZERO);
+        }
+        let mass = vec![4.0f32 / n as f32; n];
+        let sim = GpuNBody::new(&device, &queue, &pos, &vel, &mass, 0.6, 0.05, 1.0);
+        for row in sim.profile(&device, &queue, 30) {
+            println!("{:>14}  {:6.3} ms", row.0, row.1);
+        }
     }
 
     /// At galaxy scale the resident stepper must stay finite and bounded.
