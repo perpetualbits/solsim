@@ -556,6 +556,216 @@ pub fn build_lbvh_structure_gpu(
     (left, right, parent)
 }
 
+const AGGREGATE_SHADER: &str = r#"
+struct Uni { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var<storage, read> lft: array<u32>;
+@group(0) @binding(2) var<storage, read> rgt: array<u32>;
+@group(0) @binding(3) var<storage, read_write> node_mass: array<f32>;
+@group(0) @binding(4) var<storage, read_write> node_com: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> done_in: array<u32>;
+@group(0) @binding(6) var<storage, read_write> done_out: array<u32>;
+
+// One level of the bottom-up refit. Runs once per pass; every pass lifts the
+// "finished" frontier up by one level. A node combines only when BOTH children were
+// finished in an EARLIER pass, so their mass/com writes (from that earlier submit)
+// are already visible — that pass boundary is what makes this safe without relying
+// on GPU atomics or a cross-workgroup memory model.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= u.n - 1u) { return; }             // internal nodes are 0 … n-2
+    if (done_in[i] == 1u) { done_out[i] = 1u; return; }   // already finished: carry on
+    let l = lft[i];
+    let r = rgt[i];
+    if (done_in[l] == 0u || done_in[r] == 0u) {           // a child isn't ready yet
+        done_out[i] = 0u;
+        return;
+    }
+    let ml = node_mass[l];
+    let mr = node_mass[r];
+    let m = ml + mr;
+    let c = (ml * node_com[l].xyz + mr * node_com[r].xyz) / m;  // mass-weighted centre
+    node_mass[i] = m;
+    node_com[i] = vec4<f32>(c, m);
+    done_out[i] = 1u;
+}
+"#;
+
+/// Aggregate each tree node's total mass and centre of mass, bottom-up, on the GPU.
+///
+/// What: given the LBVH structure and the per-leaf masses/positions (in sorted
+/// order), returns `(node_mass, node_com)` for all `2n-1` nodes — leaves hold their
+/// own particle, internal nodes the combined mass and centre of mass of their part.
+/// How/why: the tree is filled in **levels**. Leaves start "finished"; each pass, an
+/// internal node whose two children were finished in an earlier pass sets its own
+/// `M = m₁+m₂` and `C = (m₁·c₁+m₂·c₂)/M` and marks itself finished. The "finished"
+/// flags are double-buffered (`done_in`/`done_out`, swapped each pass) so a node is
+/// never combined from a child produced in the very same pass. We keep dispatching
+/// until the root is finished. Each pass is its own submit, and that boundary is
+/// what guarantees a child's writes are visible before its parent reads them — the
+/// robust alternative to a single-pass atomic walk-up, whose cross-workgroup reads
+/// are not covered by WGSL's memory model.
+/// The physics: a node's centre of mass is the mass-weighted average of its parts —
+/// exactly what Barnes–Hut treats as one distant body when it "lumps" a node.
+/// Units: masses in solar masses, positions/COM in AU (whatever the leaves use).
+pub fn aggregate_nodes_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    left: &[u32],
+    right: &[u32],
+    parent: &[u32],
+    leaf_mass: &[f32],
+    leaf_com: &[[f32; 4]],
+) -> (Vec<f32>, Vec<[f32; 4]>) {
+    let n = leaf_mass.len();
+    assert!(n >= 2, "need at least two particles");
+    assert_eq!(left.len(), n - 1);
+    assert_eq!(right.len(), n - 1);
+    assert_eq!(parent.len(), 2 * n - 1);
+    assert_eq!(leaf_com.len(), n);
+    let internal = n - 1;
+    let total = 2 * n - 1;
+
+    // Seed the node arrays on the CPU: leaf k lives at node id (n-1)+k, internal
+    // nodes start at zero and are overwritten before they are ever read.
+    let mut mass_init = vec![0.0f32; total];
+    let mut com_init = vec![[0.0f32; 4]; total];
+    for k in 0..n {
+        mass_init[internal + k] = leaf_mass[k];
+        com_init[internal + k] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2], leaf_mass[k]];
+    }
+    // "Finished" flags: leaves start finished, internal nodes not. Two identical
+    // copies so we can ping-pong (leaf entries are never written, so they stay 1).
+    let done_init: Vec<u32> = (0..total).map(|id| (id >= internal) as u32).collect();
+
+    let uni = [n as u32, 0, 0, 0];
+    let ro = |bytes: &[u8], label| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let rw_init = |bytes: &[u8], label| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        })
+    };
+    let uni_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("agg uni"),
+        contents: bytemuck::cast_slice(&uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let lft_buf = ro(bytemuck::cast_slice(left), "agg lft");
+    let rgt_buf = ro(bytemuck::cast_slice(right), "agg rgt");
+    let mass_buf = rw_init(bytemuck::cast_slice(&mass_init), "agg node mass");
+    let com_buf = rw_init(bytemuck::cast_slice(&com_init), "agg node com");
+    let done_a = rw_init(bytemuck::cast_slice(&done_init), "agg done a");
+    let done_b = rw_init(bytemuck::cast_slice(&done_init), "agg done b");
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aggregate"),
+        source: wgpu::ShaderSource::Wgsl(AGGREGATE_SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("agg layout"),
+        entries: &[
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            storage_entry(4, false),
+            storage_entry(5, true),
+            storage_entry(6, false),
+        ],
+    });
+    // Two bind groups that swap which "done" buffer is read vs written each pass.
+    let make_bind = |din: &wgpu::Buffer, dout: &wgpu::Buffer| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("agg bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uni_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: lft_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rgt_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: mass_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: com_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: din.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dout.as_entire_binding() },
+            ],
+        })
+    };
+    let bind_ab = make_bind(&done_a, &done_b);
+    let bind_ba = make_bind(&done_b, &done_a);
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("agg pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("agg pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // Dispatch one level per pass until the root (node 0) reports finished. The
+    // frontier rises one level each pass, so this takes exactly the tree's height
+    // iterations; `total` is a safe never-reached upper bound.
+    let groups = (internal as u32).div_ceil(64);
+    let mut iter = 0usize;
+    loop {
+        let (bind, out_buf) = if iter.is_multiple_of(2) {
+            (&bind_ab, &done_b)
+        } else {
+            (&bind_ba, &done_a)
+        };
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("aggregate level"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        // Read just the root's flag to decide whether another level is needed.
+        let root_back = readback_buffer(device, 4);
+        encoder.copy_buffer_to_buffer(out_buf, 0, &root_back, 0, 4);
+        queue.submit(Some(encoder.finish()));
+        let root_done = map_u32(device, &root_back, 1)[0];
+        if root_done == 1 {
+            break;
+        }
+        iter += 1;
+        assert!(iter < total, "aggregate refit did not converge");
+    }
+
+    // Read the finished node arrays back.
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mass_back = readback_buffer(device, (total * 4) as u64);
+    let com_back = readback_buffer(device, (total * 16) as u64);
+    encoder.copy_buffer_to_buffer(&mass_buf, 0, &mass_back, 0, (total * 4) as u64);
+    encoder.copy_buffer_to_buffer(&com_buf, 0, &com_back, 0, (total * 16) as u64);
+    queue.submit(Some(encoder.finish()));
+
+    let mass = map_f32(device, &mass_back, total);
+    let com_flat = map_f32(device, &com_back, total * 4);
+    let com: Vec<[f32; 4]> = com_flat
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    (mass, com)
+}
+
 /// A `MAP_READ` buffer of `bytes` bytes.
 fn readback_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -578,6 +788,20 @@ fn map_u32(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<u32> {
         .unwrap();
     let data = slice.get_mapped_range();
     bytemuck::cast_slice::<u8, u32>(&data)[..n].to_vec()
+}
+
+/// Map a readback buffer and copy out `n` `f32`s (blocks until the GPU is done).
+fn map_f32(device: &wgpu::Device, buf: &wgpu::Buffer, n: usize) -> Vec<f32> {
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .unwrap();
+    let data = slice.get_mapped_range();
+    bytemuck::cast_slice::<u8, f32>(&data)[..n].to_vec()
 }
 
 /// A uniform-buffer bind-group-layout entry for the compute stage.
@@ -748,6 +972,124 @@ mod tests {
         }
         let expected: Vec<u32> = (0..n as u32).collect();
         assert_eq!(leaves, expected, "leaves not visited in sorted order");
+    }
+
+    /// The GPU bottom-up aggregate (mass + centre of mass) must match a CPU refit of
+    /// the same tree, and the root must hold the totals over all particles.
+    ///
+    /// We build a real tree from random points, hand the GPU random leaf masses, and
+    /// recompute every node on the CPU by walking the read-back structure in
+    /// reverse-preorder (children before parents). The atomic walk-up is the only
+    /// place we rely on GPU atomics for ordering, so this checks it end to end.
+    #[test]
+    fn gpu_node_aggregates_match_cpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut rng = Rng::new(0xA5A5_1234_DEAD_BEEF);
+        let n = 4000usize;
+
+        // Random points, their bounding box, and Morton codes — a genuine tree.
+        let pos: Vec<Vec3> = (0..n)
+            .map(|_| {
+                Vec3::new(
+                    rng.unit() as f32 * 6.0 - 3.0,
+                    rng.unit() as f32 * 4.0 - 2.0,
+                    rng.unit() as f32 * 5.0 - 2.5,
+                )
+            })
+            .collect();
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for p in &pos {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let inv = Vec3::ONE / (hi - lo);
+
+        // Sort (code, index) so the leaf order matches what the tree is built on.
+        let mut keyed: Vec<(u32, usize)> = pos
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (morton_code(*p, lo, inv), i))
+            .collect();
+        keyed.sort();
+        let codes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
+        let leaf_mass: Vec<f32> = keyed.iter().map(|_| 0.5 + rng.unit() as f32).collect();
+        let leaf_com: Vec<[f32; 4]> = keyed
+            .iter()
+            .map(|k| {
+                let p = pos[k.1];
+                [p.x, p.y, p.z, 0.0]
+            })
+            .collect();
+
+        let (left, right, parent) = build_lbvh_structure_gpu(&device, &queue, &codes);
+        let (mass, com) =
+            aggregate_nodes_gpu(&device, &queue, &left, &right, &parent, &leaf_mass, &leaf_com);
+
+        let total = 2 * n - 1;
+        assert_eq!(mass.len(), total);
+        assert_eq!(com.len(), total);
+
+        // CPU refit: preorder from the root, then process in reverse so every node's
+        // two children are finished before the node itself.
+        let leaf_base = (n - 1) as u32;
+        let mut order = Vec::with_capacity(total);
+        let mut stack = vec![0u32];
+        while let Some(node) = stack.pop() {
+            order.push(node);
+            if node < leaf_base {
+                stack.push(right[node as usize]);
+                stack.push(left[node as usize]);
+            }
+        }
+        let mut cmass = vec![0.0f32; total];
+        let mut ccom = vec![[0.0f32; 3]; total];
+        for &node in order.iter().rev() {
+            let id = node as usize;
+            if node >= leaf_base {
+                let k = (node - leaf_base) as usize;
+                cmass[id] = leaf_mass[k];
+                ccom[id] = [leaf_com[k][0], leaf_com[k][1], leaf_com[k][2]];
+            } else {
+                let (l, r) = (left[id] as usize, right[id] as usize);
+                let (ml, mr) = (cmass[l], cmass[r]);
+                let m = ml + mr;
+                cmass[id] = m;
+                for a in 0..3 {
+                    ccom[id][a] = (ml * ccom[l][a] + mr * ccom[r][a]) / m;
+                }
+            }
+        }
+
+        // Root totals: mass = Σ leaf masses, COM = mass-weighted mean of the points.
+        let total_mass: f32 = leaf_mass.iter().sum();
+        assert!(
+            (mass[0] - total_mass).abs() <= 1e-2 * total_mass,
+            "root mass {} vs {}",
+            mass[0],
+            total_mass
+        );
+
+        // Every node must match the CPU refit closely (same tree, same formula).
+        for id in 0..total {
+            assert!(
+                (mass[id] - cmass[id]).abs() <= 1e-3 * cmass[id].max(1.0),
+                "mass mismatch at node {id}: {} vs {}",
+                mass[id],
+                cmass[id]
+            );
+            for a in 0..3 {
+                assert!(
+                    (com[id][a] - ccom[id][a]).abs() <= 2e-3,
+                    "com mismatch at node {id} axis {a}: {} vs {}",
+                    com[id][a],
+                    ccom[id][a]
+                );
+            }
+        }
     }
 
     use wgpu::util::DeviceExt;

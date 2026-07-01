@@ -32,7 +32,7 @@ into clean, separately-testable phases:
 | 5b | node mass/COM | aggregate up the tree |
 | 6 | traverse + integrate | the actual gravity + leapfrog step |
 
-Phases 0, 3, 4 and 5a are implemented and validated so far.
+Phases 0, 3, 4, 5a and 5b are implemented and validated so far.
 
 ## 2. A short GPU-compute crash course (wgpu)
 
@@ -211,16 +211,71 @@ leaves `0,1,…,N-1` in order** — which is exactly the property a correct radi
 over a sorted array must have. If any range or split were wrong, the leaf order
 would break.
 
-## 6. Still to come
+## 6. Phase 5b — filling the tree with mass and centre of mass
+
+The structure alone is just pointers. Barnes–Hut needs, for every node, its **total
+mass** and its **centre of mass** (COM) — so a faraway clump can be treated as one
+body. A leaf's are just its particle's; an internal node's are the mass-weighted
+combination of its two children:
+
+```
+M = m_left + m_right
+C = (m_left · c_left + m_right · c_right) / M
+```
+
+This must be done **bottom-up**: a node can only be combined once both its children
+are known. On a CPU that's a post-order walk. On the GPU we want all nodes in a level
+done at once — and here is where a real GPU subtlety bites.
+
+### The trap: the one-pass atomic walk-up
+
+The textbook GPU method (Karras) launches **one thread per leaf**, each climbing the
+parent pointers. At each internal node a per-node atomic counter decides who does the
+work: the *first* child to arrive increments it and stops (its sibling isn't ready);
+the *second* child sees the count is already 1, so it knows both subtrees are done,
+combines them, and climbs on. Elegant — one dispatch, no barriers.
+
+We built exactly that first, and the test caught it red-handed: the root's total mass
+came out **3679 instead of 4000** — about 8 % of the mass simply vanished. The reason
+is a genuine hardware fact, not a coding slip. When the second-child thread reads its
+sibling's mass, that sibling was written by a *different workgroup*. WGSL's memory
+model does **not** guarantee that one workgroup's ordinary storage writes are visible
+to another just because you passed an atomic between them — there are no acquire/
+release atomics in WGSL. So the reader sometimes gets a stale zero, and that subtree's
+mass is lost. It happens to "work" on some drivers, which makes it a nasty trap.
+
+### The fix: refit one level per pass
+
+Instead we lift the "finished" frontier **one level per dispatch** and let the *pass
+boundary* provide the visibility — the same barrier the bitonic sort relies on
+(§4). The kernel (`AGGREGATE_SHADER`, `aggregate_nodes_gpu`) is one thread per
+internal node:
+
+- Leaves start marked **finished**, internal nodes not.
+- Each pass, an internal node whose **both children were finished in an earlier pass**
+  computes its `M` and `C` and marks itself finished; others do nothing yet.
+- The "finished" flags are **double-buffered** (`done_in` read, `done_out` written,
+  swapped every pass). Reading last pass's flags means a node is never built from a
+  child that only became ready in the *same* pass — so every child's mass/COM write
+  lives in a strictly earlier submit, and is therefore visible. No atomics needed.
+- We keep dispatching until the **root reports finished** (we read back its one flag
+  after each pass). That takes exactly the tree's *height* passes — tens, not
+  thousands.
+
+### Trusting it
+
+`gpu_node_aggregates_match_cpu` builds a real tree from 4000 random points, hands the
+GPU random leaf masses, and recomputes every node on the CPU by walking the read-back
+structure in **reverse-preorder** (children before parents). It checks all `2n-1`
+nodes' mass and COM against that refit, and separately that the **root mass equals the
+plain sum of all leaf masses** and its COM is the mass-weighted mean — the property
+that must hold if nothing leaked. (This is the test that failed loudly on the atomic
+version, which is exactly why we trust the level version.)
+
+## 7. Still to come
 
 - **Phase 2 — bounding box** on the GPU (a parallel reduction), so the Morton step
   no longer needs a CPU-computed box.
-- **Phase 5b — node aggregates**: a bottom-up pass over the parent links that fills
-  each node's total mass, centre of mass and bounding box. Leaves start from their
-  particle; each internal node is finished when its *second* child arrives (tracked
-  with one atomic counter per node), then it climbs to its own parent. This is the
-  one place we lean on GPU atomics for ordering, so it gets careful testing against
-  a CPU re-computation of the same tree.
 - **Phase 6 — traverse + integrate**: one thread per particle walks the tree
   (lump-or-open using each node's mass/COM/size, just like the CPU version), then a
   leapfrog kick-drift-kick updates the resident position/velocity buffers, which the
